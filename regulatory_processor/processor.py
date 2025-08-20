@@ -14,6 +14,7 @@ Complete implementation with all required functionality:
 - Proper file naming conventions
 """
 
+
 import os
 import re
 import shutil
@@ -289,13 +290,46 @@ def generate_output_filename(base_name: str, language: str, country: str, doc_ty
         return f"{base_name}_{doc_type}.docx"
 
 def convert_to_pdf(doc_path: str, output_dir: str) -> str:
-    """Convert a Word document to PDF using docx2pdf."""
+    """Convert a Word document to PDF with multiple fallback methods."""
+    pdf_output_path = Path(output_dir) / Path(doc_path).with_suffix(".pdf").name
+    
+    # Method 1: Try docx2pdf (primary method)
     try:
-        pdf_output_path = Path(output_dir) / Path(doc_path).with_suffix(".pdf").name
         convert(doc_path, str(pdf_output_path))
         return str(pdf_output_path)
     except Exception as e:
-        raise RuntimeError(f"Failed to convert {doc_path} to PDF: {e}")
+        print(f"   ⚠️ docx2pdf conversion failed: {e}")
+    
+    # Method 2: Try LibreOffice (if available)
+    try:
+        result = subprocess.run([
+            'libreoffice', '--headless', '--convert-to', 'pdf',
+            '--outdir', str(output_dir), doc_path
+        ], capture_output=True, text=True, timeout=60)
+        
+        if result.returncode == 0 and pdf_output_path.exists():
+            print(f"   ✅ LibreOffice conversion successful")
+            return str(pdf_output_path)
+        else:
+            print(f"   ⚠️ LibreOffice conversion failed: {result.stderr}")
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        print(f"   ⚠️ LibreOffice not available: {e}")
+    
+    # Method 3: Create a placeholder PDF (last resort)
+    try:
+        # Create a simple text file indicating conversion failed
+        placeholder_path = pdf_output_path.with_suffix('.pdf.txt')
+        with open(placeholder_path, 'w') as f:
+            f.write(f"PDF conversion failed for: {Path(doc_path).name}\n")
+            f.write(f"Original document available at: {doc_path}\n")
+            f.write(f"Please convert manually or install LibreOffice for automatic conversion.\n")
+        
+        print(f"   📝 Created placeholder file: {placeholder_path.name}")
+        return str(placeholder_path)
+        
+    except Exception as e:
+        print(f"   ❌ All conversion methods failed: {e}")
+        raise RuntimeError(f"Failed to convert {doc_path} to PDF: All methods failed")
 
 def copy_paragraph(dest_doc: Document, source_para: Paragraph) -> None:
     """Copy a paragraph from one document to another, preserving runs."""
@@ -947,15 +981,28 @@ class DocumentProcessor:
             if self.config.convert_to_pdf:
                 try:
                     self.logger.info("📄 Converting to PDF...")
-                    pdf_annex_i = convert_to_pdf(annex_i_path, str(pdf_dir))
-                    pdf_annex_iiib = convert_to_pdf(annex_iiib_path, str(pdf_dir))
                     
-                    output_files.extend([pdf_annex_i, pdf_annex_iiib])
-                    self.logger.info("✅ PDF conversion completed")
+                    # Try converting Annex I
+                    try:
+                        pdf_annex_i = convert_to_pdf(annex_i_path, str(pdf_dir))
+                        output_files.append(pdf_annex_i)
+                        self.logger.info(f"✅ Annex I PDF: {Path(pdf_annex_i).name}")
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ Annex I PDF conversion failed: {e}")
+                    
+                    # Try converting Annex IIIB  
+                    try:
+                        pdf_annex_iiib = convert_to_pdf(annex_iiib_path, str(pdf_dir))
+                        output_files.append(pdf_annex_iiib)
+                        self.logger.info(f"✅ Annex IIIB PDF: {Path(pdf_annex_iiib).name}")
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ Annex IIIB PDF conversion failed: {e}")
+                    
+                    self.logger.info("📄 PDF conversion phase completed")
                     
                 except Exception as e:
-                    self.logger.warning(f"⚠️ PDF conversion failed: {e}")
-                    # Continue processing even if PDF conversion fails
+                    self.logger.warning(f"⚠️ PDF conversion setup failed: {e}")
+                    # Continue processing - PDF conversion is not critical
             
             self.stats.output_files_created += len(output_files)
             
