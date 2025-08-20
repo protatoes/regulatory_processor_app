@@ -24,6 +24,7 @@ from typing import Dict, List, Optional, Tuple, NamedTuple, Union
 from dataclasses import dataclass
 from datetime import datetime
 import pandas as pd
+import subprocess
 from docx import Document
 from docx.text.paragraph import Paragraph
 from docx.text.run import Run
@@ -97,7 +98,7 @@ class ProcessingConfig:
     convert_to_pdf: bool = True
     overwrite_existing: bool = False
     log_level: str = "INFO"
-    country_delimiter: str = ", "
+    country_delimiter: str = ";"
 
 # ============================================================================= 
 # DATE FORMATTING SYSTEM
@@ -588,8 +589,231 @@ def update_local_representatives(doc: Document, mapping_row: pd.Series) -> bool:
     
     return found
 
+# ============================================================================= 
+# Split Annexes Workflow
+# =============================================================================
+
 def split_annexes(source_path: str, output_dir: str, language: str, country: str, mapping_row: pd.Series) -> Tuple[str, str]:
     """Split a combined SmPC document into Annex I and Annex IIIB documents."""
+    return split_annexes_with_validation(source_path, output_dir, language, country, mapping_row)
+
+def split_annexes_enhanced(source_path: str, output_dir: str, language: str, country: str, mapping_row: pd.Series) -> Tuple[str, str]:
+    """
+    Split a combined SmPC document into Annex I and Annex IIIB documents using language-specific headers.
+    
+    This enhanced version uses the mapping file's language-specific headers and implements
+    a bottom-up approach:
+    1. First identify and split Annex IIIB (using "Annex IIIB Header in country language")
+    2. Then identify and split Annex II (using "Annex II Header in country language") 
+    3. Everything that remains becomes Annex I
+    
+    Args:
+        source_path: Path to the combined document
+        output_dir: Directory to save split documents
+        language: Language of the document
+        country: Country of the document
+        mapping_row: Row from mapping file containing language-specific headers
+        
+    Returns:
+        Tuple of (annex_i_path, annex_iiib_path)
+    """
+    
+    # Load the document
+    doc = Document(source_path)
+    
+    # Get language-specific headers from mapping file
+    annex_ii_header = str(mapping_row.get('Annex II Header in country language', '')).strip()
+    annex_iiib_header = str(mapping_row.get('Annex IIIB Header in country language', '')).strip()
+    
+    # Validate headers are available
+    if not annex_ii_header or annex_ii_header.lower() == 'nan':
+        raise ValueError(f"Missing Annex II header for {country} ({language})")
+    if not annex_iiib_header or annex_iiib_header.lower() == 'nan':
+        raise ValueError(f"Missing Annex IIIB header for {country} ({language})")
+    
+    print(f"🔍 Using headers for {country} ({language}):")
+    print(f"   Annex II: '{annex_ii_header}'")
+    print(f"   Annex IIIB: '{annex_iiib_header}'")
+    
+    # Find split points by scanning all paragraphs
+    annex_ii_split_index = None
+    annex_iiib_split_index = None
+    
+    for idx, para in enumerate(doc.paragraphs):
+        text = para.text.strip()
+        
+        # Look for Annex II header (case-insensitive, flexible matching)
+        if annex_ii_split_index is None and _is_header_match(text, annex_ii_header):
+            annex_ii_split_index = idx
+            print(f"✅ Found Annex II header at paragraph {idx}: '{text[:50]}...'")
+        
+        # Look for Annex IIIB header (case-insensitive, flexible matching)
+        if annex_iiib_split_index is None and _is_header_match(text, annex_iiib_header):
+            annex_iiib_split_index = idx
+            print(f"✅ Found Annex IIIB header at paragraph {idx}: '{text[:50]}...'")
+    
+    # Validate that we found the required headers
+    if annex_ii_split_index is None:
+        raise ValueError(f"Could not find Annex II header '{annex_ii_header}' in document")
+    if annex_iiib_split_index is None:
+        raise ValueError(f"Could not find Annex IIIB header '{annex_iiib_header}' in document")
+    
+    # Ensure proper order (Annex II should come before Annex IIIB)
+    if annex_ii_split_index >= annex_iiib_split_index:
+        raise ValueError(f"Document structure error: Annex II (para {annex_ii_split_index}) should come before Annex IIIB (para {annex_iiib_split_index})")
+    
+    print(f"📊 Split points identified:")
+    print(f"   Annex I: paragraphs 0 to {annex_ii_split_index - 1}")
+    print(f"   Annex II: paragraphs {annex_ii_split_index} to {annex_iiib_split_index - 1}")
+    print(f"   Annex IIIB: paragraphs {annex_iiib_split_index} to end")
+    
+    # Create new documents
+    annex_i_doc = Document()
+    annex_iiib_doc = Document()
+    
+    # Split the document based on identified boundaries
+    for idx, para in enumerate(doc.paragraphs):
+        if idx < annex_ii_split_index:
+            # Annex I content (everything before Annex II)
+            copy_paragraph(annex_i_doc, para)
+        elif idx >= annex_iiib_split_index:
+            # Annex IIIB content (everything from Annex IIIB header onwards)
+            copy_paragraph(annex_iiib_doc, para)
+        # Note: We skip Annex II content (between annex_ii_split_index and annex_iiib_split_index)
+        # as we only need Annex I and Annex IIIB for the final output
+    
+    # Generate output paths
+    base_name = Path(source_path).stem
+    annex_i_filename = generate_output_filename(base_name, language, country, "annex_i")
+    annex_iiib_filename = generate_output_filename(base_name, language, country, "annex_iiib")
+    
+    annex_i_path = os.path.join(output_dir, annex_i_filename)
+    annex_iiib_path = os.path.join(output_dir, annex_iiib_filename)
+    
+    # Save documents
+    annex_i_doc.save(annex_i_path)
+    annex_iiib_doc.save(annex_iiib_path)
+    
+    print(f"💾 Created: {annex_i_filename}")
+    print(f"💾 Created: {annex_iiib_filename}")
+    
+    return annex_i_path, annex_iiib_path
+
+
+def _is_header_match(paragraph_text: str, header_text: str) -> bool:
+    """
+    Check if a paragraph text matches a header with flexible matching.
+    
+    This function implements fuzzy matching to handle variations in:
+    - Case sensitivity
+    - Extra whitespace
+    - Minor punctuation differences
+    - Partial matches for very long headers
+    
+    Args:
+        paragraph_text: Text from the document paragraph
+        header_text: Expected header text from mapping file
+        
+    Returns:
+        True if the paragraph likely contains the header
+    """
+    
+    # Normalize both texts for comparison
+    para_normalized = _normalize_text_for_matching(paragraph_text)
+    header_normalized = _normalize_text_for_matching(header_text)
+    
+    # Exact match after normalization
+    if para_normalized == header_normalized:
+        return True
+    
+    # Check if header is contained in paragraph (for cases where paragraph has extra content)
+    if header_normalized in para_normalized:
+        return True
+    
+    # Check if paragraph is contained in header (for cases where paragraph is truncated)
+    if para_normalized in header_normalized and len(para_normalized) > 5:
+        return True
+    
+    # For very short headers, be more strict
+    if len(header_normalized) <= 10:
+        return para_normalized == header_normalized
+    
+    # For longer headers, allow partial match if similarity is high
+    if len(header_normalized) > 10:
+        # Simple similarity check: count matching words
+        para_words = set(para_normalized.split())
+        header_words = set(header_normalized.split())
+        
+        if len(header_words) == 0:
+            return False
+            
+        # Calculate similarity ratio
+        common_words = para_words.intersection(header_words)
+        similarity = len(common_words) / len(header_words)
+        
+        # Require high similarity for positive match
+        return similarity >= 0.8
+    
+    return False
+
+
+def _normalize_text_for_matching(text: str) -> str:
+    """
+    Normalize text for header matching by removing inconsistencies.
+    
+    Args:
+        text: Raw text to normalize
+        
+    Returns:
+        Normalized text suitable for comparison
+    """
+    
+    # Convert to lowercase
+    normalized = text.lower()
+    
+    # Remove extra whitespace and normalize spaces
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    
+    # Remove common punctuation that might vary
+    normalized = re.sub(r'[.,;:!?""''""()]', '', normalized)
+    
+    # Remove common formatting artifacts
+    normalized = re.sub(r'[\r\n\t]', ' ', normalized)
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    
+    return normalized
+
+def split_annexes_with_validation(source_path: str, output_dir: str, language: str, country: str, mapping_row: pd.Series) -> Tuple[str, str]:
+    """
+    Wrapper function that adds validation and error handling to the enhanced splitting logic.
+    
+    This function can be used as a drop-in replacement for the original split_annexes function.
+    """
+    
+    try:
+        return split_annexes_enhanced(source_path, output_dir, language, country, mapping_row)
+    
+    except ValueError as e:
+        print(f"❌ Validation error during splitting: {e}")
+        print(f"🔄 Falling back to original splitting method...")
+        
+        # Fallback to original method if enhanced method fails
+        return split_annexes_original(source_path, output_dir, language, country, mapping_row)
+    
+    except Exception as e:
+        print(f"❌ Unexpected error during enhanced splitting: {e}")
+        print(f"🔄 Falling back to original splitting method...")
+        
+        # Fallback to original method if enhanced method fails
+        return split_annexes_original(source_path, output_dir, language, country, mapping_row)
+
+
+def split_annexes_original(source_path: str, output_dir: str, language: str, country: str, mapping_row: pd.Series) -> Tuple[str, str]:
+    """
+    Original splitting logic as fallback.
+    This is the existing implementation for compatibility.
+    """
+    
     doc = Document(source_path)
     
     # Create new documents
@@ -601,7 +825,7 @@ def split_annexes(source_path: str, output_dir: str, language: str, country: str
     for para in doc.paragraphs:
         text = para.text.strip()
         
-        # Determine which section we're in
+        # Determine which section we're in using original logic
         if 'ANNEX I' in text.upper() or 'SUMMARY OF PRODUCT CHARACTERISTICS' in text.upper():
             current_section = 'annex_i'
         elif 'ANNEX III' in text.upper() or 'PACKAGE LEAFLET' in text.upper():
@@ -626,6 +850,7 @@ def split_annexes(source_path: str, output_dir: str, language: str, country: str
     annex_iiib_doc.save(annex_iiib_path)
     
     return annex_i_path, annex_iiib_path
+
 
 # ============================================================================= 
 # ENHANCED PROCESSOR CLASSES
