@@ -1,2 +1,11 @@
 
+# Core document processing dependencies
+pandas>=1.5.0
+python-docx>=0.8.11
+docx2pdf>=0.1.8
+
+# Web interface (existing)
 reflex==0.8.5
+
+# Optional: For better PDF conversion (if LibreOffice not available)
+# python-libreoffice>=0.1.0
