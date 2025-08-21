@@ -348,11 +348,342 @@ def copy_paragraph(dest_doc: Document, source_para: Paragraph) -> None:
 # ============================================================================= 
 # DOCUMENT UPDATE FUNCTIONS
 # =============================================================================
+def is_hex_gray_color(hex_color: str) -> bool:
+    """Check if a hex color represents a gray shade."""
+    if not hex_color:
+        return False
+    
+    hex_color = hex_color.replace('#', '').upper()
+    
+    gray_hex_values = [
+        'BFBFBF', 'CCCCCC', 'D9D9D9', '808080', '999999', 
+        '666666', 'C0C0C0', 'A0A0A0'
+    ]
+    
+    if hex_color in gray_hex_values:
+        return True
+    
+    # Check if R=G=B (indicates gray)
+    try:
+        if len(hex_color) == 6:
+            r = int(hex_color[0:2], 16)
+            g = int(hex_color[2:4], 16)
+            b = int(hex_color[4:6], 16)
+            return r == g == b
+    except ValueError:
+        pass
+    
+    return False
+
+
+def is_run_gray_shaded(run: Run) -> bool:
+    """Check if a run has gray shading."""
+    try:
+        run_pr = run._element.get_or_add_rPr()
+        shading_elements = run_pr.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}shd')
+        
+        if shading_elements:
+            for shading in shading_elements:
+                fill = shading.get(qn('w:fill'))
+                if fill and is_hex_gray_color(fill):
+                    return True
+        
+        # Check font color for gray
+        if run.font.color and hasattr(run.font.color, 'rgb'):
+            gray_colors = [
+                RGBColor(128, 128, 128), RGBColor(153, 153, 153), 
+                RGBColor(102, 102, 102), RGBColor(96, 96, 96),
+                RGBColor(217, 217, 217), RGBColor(191, 191, 191)
+            ]
+            if run.font.color.rgb in gray_colors:
+                return True
+                
+    except Exception:
+        pass
+    
+    return False
+
+
+def is_run_hyperlink(run: Run) -> bool:
+    """Check if a run is part of a hyperlink."""
+    try:
+        run_xml = run._r
+        hyperlink_elements = run_xml.xpath('.//w:hyperlink')
+        if hyperlink_elements:
+            return True
+            
+        # Check hyperlink-style formatting
+        if (run.font.color and hasattr(run.font.color, 'rgb') and 
+            run.font.color.rgb == RGBColor(0, 0, 255) and run.underline):
+            return True
+            
+    except Exception:
+        pass
+    
+    return False
+
+
+def find_target_text_runs(para: Paragraph, target_string: str) -> List[Run]:
+    """
+    Find runs that contain the target text to be replaced.
+    """
+    target_runs = []
+    
+    # Build text map to find position
+    char_pos = 0
+    run_positions = []
+    
+    for run in para.runs:
+        run_start = char_pos
+        run_end = char_pos + len(run.text)
+        run_positions.append((run, run_start, run_end))
+        char_pos = run_end
+    
+    # Find target string position in full text
+    full_text = para.text
+    target_start = full_text.lower().find(target_string.lower())
+    
+    if target_start == -1:
+        return []
+    
+    target_end = target_start + len(target_string)
+    
+    # Find runs that overlap with target text
+    for run, run_start, run_end in run_positions:
+        # Check if run overlaps with target range
+        if (run_start < target_end and run_end > target_start):
+            target_runs.append(run)
+    
+    return target_runs
+
+
+def find_target_text_range(para: Paragraph, target_string: str) -> Tuple[int, int]:
+    """Find the complete target text range in paragraph."""
+    full_text = para.text.lower()
+    target_lower = target_string.lower()
+    
+    # Try exact match first
+    start_pos = full_text.find(target_lower)
+    if start_pos != -1:
+        return start_pos, start_pos + len(target_string)
+    
+    # Try to find key parts
+    key_phrases = ['national reporting system', 'appendix v', 'listed in appendix']
+    
+    earliest_start = len(full_text)
+    latest_end = 0
+    
+    for phrase in key_phrases:
+        pos = full_text.find(phrase)
+        if pos != -1:
+            earliest_start = min(earliest_start, pos)
+            latest_end = max(latest_end, pos + len(phrase))
+    
+    if earliest_start < len(full_text):
+        return earliest_start, latest_end
+    
+    return -1, -1
+
+
+def find_runs_to_remove(para: Paragraph, target_string: str) -> List[Run]:
+    """Find runs that should be removed (gray shaded, hyperlinks, or target text)."""
+    runs_to_remove = []
+    
+    target_start, target_end = find_target_text_range(para, target_string)
+    
+    if target_start == -1:
+        return runs_to_remove
+    
+    # Map character positions to runs
+    char_pos = 0
+    run_ranges = []
+    
+    for run in para.runs:
+        run_start = char_pos
+        run_end = char_pos + len(run.text)
+        run_ranges.append((run, run_start, run_end))
+        char_pos = run_end
+    
+    # Find runs to remove
+    for run, run_start, run_end in run_ranges:
+        should_remove = False
+        
+        # Check if run overlaps with target range
+        if run_start < target_end and run_end > target_start:
+            should_remove = True
+        # Check if it's gray shaded
+        elif is_run_gray_shaded(run):
+            should_remove = True
+        # Check if it's a hyperlink
+        elif is_run_hyperlink(run):
+            should_remove = True
+        
+        if should_remove:
+            runs_to_remove.append(run)
+    
+    return runs_to_remove
+
+
+def find_gray_and_hyperlink_runs(para: Paragraph, target_string: str) -> List[Run]:
+    """
+    Find all gray shaded runs and hyperlink runs that should be removed.
+    """
+    runs_to_remove = []
+    
+    # First find runs containing target text
+    target_runs = find_target_text_runs(para, target_string)
+    
+    # Then find additional gray/hyperlink runs in vicinity
+    for run in para.runs:
+        should_remove = False
+        
+        # Remove if it's a target run
+        if run in target_runs:
+            should_remove = True
+        # Remove if it's gray shaded
+        elif is_run_gray_shaded(run):
+            should_remove = True
+        # Remove if it's a hyperlink
+        elif is_run_hyperlink(run):
+            should_remove = True
+        
+        if should_remove:
+            runs_to_remove.append(run)
+    
+    return runs_to_remove
+
+
+def create_hyperlink_run(para: Paragraph, text: str, url: str) -> Run:
+    """
+    Create a proper hyperlink run in the paragraph.
+    """
+    try:
+        # Create hyperlink element
+        hyperlink = OxmlElement('w:hyperlink')
+        hyperlink.set(qn('r:id'), '')  # External link
+        hyperlink.set(qn('w:anchor'), url)
+        
+        # Create run within hyperlink
+        run_element = OxmlElement('w:r')
+        run_props = OxmlElement('w:rPr')
+        
+        # Add hyperlink styling
+        color = OxmlElement('w:color')
+        color.set(qn('w:val'), '0000FF')
+        run_props.append(color)
+        
+        underline = OxmlElement('w:u')
+        underline.set(qn('w:val'), 'single')
+        run_props.append(underline)
+        
+        run_element.append(run_props)
+        
+        # Add text
+        text_element = OxmlElement('w:t')
+        text_element.text = text
+        run_element.append(text_element)
+        
+        hyperlink.append(run_element)
+        
+        # Insert into paragraph
+        para._p.append(hyperlink)
+        
+        # Return the run object
+        return Run(run_element, para)
+        
+    except Exception as e:
+        # Fallback to styled text if hyperlink creation fails
+        run = para.add_run(text)
+        run.font.color.rgb = RGBColor(0, 0, 255)
+        run.underline = True
+        return run
+
+def find_runs_to_remove(para: Paragraph, target_string: str) -> List[Run]:
+    """Find runs that should be removed (gray shaded, hyperlinks, or target text)."""
+    runs_to_remove = []
+    
+    target_start, target_end = find_target_text_range(para, target_string)
+    
+    if target_start == -1:
+        return runs_to_remove
+    
+    # Map character positions to runs
+    char_pos = 0
+    run_ranges = []
+    
+    for run in para.runs:
+        run_start = char_pos
+        run_end = char_pos + len(run.text)
+        run_ranges.append((run, run_start, run_end))
+        char_pos = run_end
+    
+    # Find runs to remove
+    for run, run_start, run_end in run_ranges:
+        should_remove = False
+        
+        # Check if run overlaps with target range
+        if run_start < target_end and run_end > target_start:
+            should_remove = True
+        # Check if it's gray shaded
+        elif is_run_gray_shaded(run):
+            should_remove = True
+        # Check if it's a hyperlink
+        elif is_run_hyperlink(run):
+            should_remove = True
+        
+        if should_remove:
+            runs_to_remove.append(run)
+    
+    return runs_to_remove
+
+
+def build_replacement_text_by_country(components: List[Dict]) -> str:
+    """Build replacement text grouped by country."""
+    # Group components by country
+    countries = {}
+    for comp in components:
+        country = comp['country']
+        if country not in countries:
+            countries[country] = []
+        countries[country].append(comp)
+    
+    # Build text for each country
+    country_blocks = []
+    
+    for country_name, country_components in countries.items():
+        # Sort components by line number
+        sorted_components = sorted(country_components, key=lambda x: x['line'])
+        
+        # Build country block
+        country_lines = []
+        
+        for comp in sorted_components:
+            line_text = comp['text']
+            hyperlink = comp.get('hyperlink')
+            email = comp.get('email')
+            
+            # Add hyperlinks if present and not already in text
+            if hyperlink and hyperlink not in line_text:
+                line_text += f" {hyperlink}"
+            if email and email not in line_text:
+                line_text += f" {email}"
+            
+            country_lines.append(line_text)
+        
+        # Join lines for this country
+        country_block = '\n'.join(country_lines)
+        country_blocks.append(country_block)
+    
+    # Join country blocks with double line breaks
+    return '\n\n'.join(country_blocks)
 
 def get_replacement_components(mapping_row: pd.Series, section_type: str, 
-                             cached_components: Optional[List] = None, 
-                             country_delimiter: str = ", ") -> List:
+                              cached_components: Optional[List] = None, 
+                              country_delimiter: str = ";") -> List:
     """Build replacement text components from mapping data."""
+    if cached_components is not None:
+        return cached_components
+    
     components = []
     
     # Get line columns for this section type
@@ -362,10 +693,18 @@ def get_replacement_components(mapping_row: pd.Series, section_type: str,
     if not line_columns:
         return components
     
-    # Get hyperlinks
+    # Get hyperlinks and email links
     hyperlinks_col = f'Hyperlinks {section_type}'
+    email_col = f'Link for email - {section_type}'
+    
     hyperlinks_str = str(mapping_row.get(hyperlinks_col, '')).strip()
-    hyperlinks = [h.strip() for h in hyperlinks_str.split(',') if h.strip() and h.strip().lower() != 'nan']
+    email_str = str(mapping_row.get(email_col, '')).strip()
+    
+    # Parse hyperlinks and emails (semicolon separated)
+    hyperlinks = [h.strip() for h in hyperlinks_str.split(country_delimiter) 
+                 if h.strip() and h.strip().lower() != 'nan']
+    emails = [e.strip() for e in email_str.split(country_delimiter) 
+             if e.strip() and e.strip().lower() != 'nan']
     
     # Sort line columns by number
     def extract_line_number(col_name):
@@ -388,6 +727,7 @@ def get_replacement_components(mapping_row: pd.Series, section_type: str,
     if not line_1_text or line_1_text.lower() == 'nan':
         return components
     
+    # Parse countries using semicolon delimiter
     countries = [c.strip() for c in line_1_text.split(country_delimiter) if c.strip()]
     
     if not countries:
@@ -401,30 +741,439 @@ def get_replacement_components(mapping_row: pd.Series, section_type: str,
         if not content or content.lower() == 'nan':
             continue
         
-        # Split content by countries using positional matching
+        # Split content by countries using semicolon delimiter
         parts = [p.strip() for p in content.split(country_delimiter)]
         
         for i, country in enumerate(countries):
             if i < len(parts) and parts[i]:
                 text = parts[i]
                 
-                # Add hyperlink if available
+                # Determine links for this country position
                 hyperlink = hyperlinks[i] if i < len(hyperlinks) else None
+                email = emails[i] if i < len(emails) else None
                 
                 components.append({
                     'line': line_num,
                     'country': country,
                     'text': text,
-                    'hyperlink': hyperlink
+                    'hyperlink': hyperlink,
+                    'email': email
                 })
     
     return components
 
+
+def insert_formatted_replacement_surgically(para: Paragraph, insertion_point: int, 
+                                          components: List[Dict], country_delimiter: str = ";"):
+    """
+    Insert properly formatted replacement text at a specific position in the paragraph.
+    """
+    # Group components by line
+    lines = {}
+    for comp in components:
+        line_num = comp['line']
+        if line_num not in lines:
+            lines[line_num] = []
+        lines[line_num].append(comp)
+    
+    # Insert at the specified position
+    current_element = None
+    if insertion_point < len(para.runs):
+        current_element = para.runs[insertion_point]._element
+    
+    # Build replacement text line by line
+    for line_idx, line_num in enumerate(sorted(lines.keys())):
+        line_components = lines[line_num]
+        
+        # Add line break before non-first lines
+        if line_idx > 0:
+            new_run = para.add_run('\n')
+            if current_element is not None:
+                current_element.addnext(new_run._element)
+                current_element = new_run._element
+        
+        # Add components for this line
+        for comp_idx, comp in enumerate(line_components):
+            # Add delimiter between components (except first)
+            if comp_idx > 0:
+                delimiter_run = para.add_run(f'{country_delimiter} ')
+                if current_element is not None:
+                    current_element.addnext(delimiter_run._element)
+                    current_element = delimiter_run._element
+            
+            text = comp['text']
+            country = comp['country']
+            hyperlink = comp.get('hyperlink')
+            email = comp.get('email')
+            
+            # Add text with country bolding
+            if country and country in text:
+                # Split text to bold only the country name
+                parts = text.split(country, 1)
+                
+                # Add text before country
+                if parts[0]:
+                    text_run = para.add_run(parts[0])
+                    if current_element is not None:
+                        current_element.addnext(text_run._element)
+                        current_element = text_run._element
+                
+                # Add bolded country name
+                country_run = para.add_run(country)
+                country_run.bold = True
+                if current_element is not None:
+                    current_element.addnext(country_run._element)
+                    current_element = country_run._element
+                
+                # Add text after country
+                if len(parts) > 1 and parts[1]:
+                    remaining_run = para.add_run(parts[1])
+                    if current_element is not None:
+                        current_element.addnext(remaining_run._element)
+                        current_element = remaining_run._element
+            else:
+                text_run = para.add_run(text)
+                if current_element is not None:
+                    current_element.addnext(text_run._element)
+                    current_element = text_run._element
+            
+            # Add hyperlink if present
+            if hyperlink:
+                hyperlink_run = create_hyperlink_run(para, f' {hyperlink}', hyperlink)
+                if current_element is not None:
+                    current_element.addnext(hyperlink_run._element)
+                    current_element = hyperlink_run._element
+            
+            # Add email link if present
+            if email:
+                email_run = create_hyperlink_run(para, f' {email}', f'mailto:{email}')
+                if current_element is not None:
+                    current_element.addnext(email_run._element)
+                    current_element = email_run._element
+
+
+def debug_paragraph_structure(para: Paragraph, target_string: str):
+    """
+    Debug function to understand paragraph structure and identify issues.
+    """
+    print(f"\n🔍 DEBUGGING PARAGRAPH STRUCTURE")
+    print(f"Full paragraph text: '{para.text}'")
+    print(f"Target string: '{target_string}'")
+    print(f"Target found: {target_string.lower() in para.text.lower()}")
+    print(f"Number of runs: {len(para.runs)}")
+    
+    for i, run in enumerate(para.runs):
+        print(f"\nRun {i}:")
+        print(f"  Text: '{run.text}'")
+        print(f"  Bold: {run.bold}")
+        print(f"  Underline: {run.underline}")
+        print(f"  Font color: {run.font.color.rgb if run.font.color else 'None'}")
+        
+        # Check for shading
+        is_shaded = is_run_gray_shaded_debug(run)
+        is_hyperlink = is_run_hyperlink_debug(run)
+        
+        print(f"  Is gray shaded: {is_shaded}")
+        print(f"  Is hyperlink: {is_hyperlink}")
+        print(f"  Should remove: {is_shaded or is_hyperlink}")
+
+
+def is_run_gray_shaded_debug(run: Run) -> bool:
+    """
+    Debug version of gray shading detection with detailed output.
+    """
+    try:
+        # Check run properties for shading
+        run_pr = run._element.get_or_add_rPr()
+        shading_elements = run_pr.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}shd')
+        
+        if shading_elements:
+            print(f"    Found shading elements: {len(shading_elements)}")
+            for shading in shading_elements:
+                fill = shading.get(qn('w:fill'))
+                print(f"    Shading fill: {fill}")
+                if fill and fill.lower() in ['d9d9d9', 'cccccc', 'gray', 'lightgray', 'auto']:
+                    return True
+        
+        # Check font color for gray
+        if run.font.color and hasattr(run.font.color, 'rgb'):
+            color = run.font.color.rgb
+            print(f"    Font color RGB: {color}")
+            gray_colors = [
+                RGBColor(128, 128, 128),  # Standard gray
+                RGBColor(153, 153, 153),  # Light gray
+                RGBColor(102, 102, 102),  # Dark gray
+                RGBColor(96, 96, 96),     # Another common gray
+                RGBColor(217, 217, 217),  # Very light gray
+            ]
+            if color in gray_colors:
+                return True
+                
+    except Exception as e:
+        print(f"    Error checking shading: {e}")
+    
+    return False
+
+
+def is_run_hyperlink_debug(run: Run) -> bool:
+    """
+    Debug version of hyperlink detection.
+    """
+    try:
+        # Check if run is within a hyperlink element
+        run_xml = run._r
+        hyperlink_elements = run_xml.xpath('.//w:hyperlink', 
+                                         namespaces={'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'})
+        if hyperlink_elements:
+            print(f"    Found hyperlink elements: {len(hyperlink_elements)}")
+            return True
+            
+        # Check hyperlink-style formatting
+        if (run.font.color and hasattr(run.font.color, 'rgb') and 
+            run.font.color.rgb == RGBColor(0, 0, 255) and run.underline):
+            print(f"    Has hyperlink-style formatting (blue + underline)")
+            return True
+            
+    except Exception as e:
+        print(f"    Error checking hyperlink: {e}")
+    
+    return False
+
+
+def find_runs_to_remove_aggressive(para: Paragraph, target_string: str) -> List[Run]:
+    """
+    More aggressive approach to find runs that should be removed.
+    """
+    runs_to_remove = []
+    
+    # First, find runs containing target text
+    target_start = para.text.lower().find(target_string.lower())
+    if target_start == -1:
+        return runs_to_remove
+    
+    target_end = target_start + len(target_string)
+    
+    # Map character positions to runs
+    char_pos = 0
+    run_ranges = []
+    
+    for run in para.runs:
+        run_start = char_pos
+        run_end = char_pos + len(run.text)
+        run_ranges.append((run, run_start, run_end))
+        char_pos = run_end
+    
+    print(f"\n🎯 TARGET RANGE: {target_start} to {target_end}")
+    
+    # Find runs that overlap with target or are adjacent problematic runs
+    for run, run_start, run_end in run_ranges:
+        should_remove = False
+        reason = ""
+        
+        # Check if run overlaps with target range
+        if run_start < target_end and run_end > target_start:
+            should_remove = True
+            reason = "overlaps with target text"
+        
+        # Check if it's gray shaded
+        elif is_run_gray_shaded_debug(run):
+            should_remove = True
+            reason = "is gray shaded"
+        
+        # Check if it's a hyperlink
+        elif is_run_hyperlink_debug(run):
+            should_remove = True
+            reason = "is hyperlink"
+        
+        # Check if it's a small connector (like period, comma) adjacent to target
+        elif (len(run.text.strip()) <= 2 and 
+              run.text.strip() in '.,;:' and
+              abs(run_start - target_end) <= 5):  # Within 5 chars of target end
+            should_remove = True
+            reason = "is small connector near target"
+        
+        print(f"Run {run_start}-{run_end}: '{run.text}' -> Remove: {should_remove} ({reason})")
+        
+        if should_remove:
+            runs_to_remove.append(run)
+    
+    return runs_to_remove
+
+
+def build_replacement_components_simple(mapping_row: pd.Series, section_type: str, 
+                                       country_delimiter: str = ";") -> List[Dict]:
+    """
+    Simplified version that focuses on getting the components right.
+    """
+    print(f"\n🔨 Building replacement components for {section_type}")
+    
+    components = []
+    
+    # Get line columns for this section type
+    line_columns = [col for col in mapping_row.index 
+                   if col.startswith('Line ') and section_type in col]
+    
+    print(f"Found line columns: {line_columns}")
+    
+    if not line_columns:
+        print("No line columns found")
+        return components
+    
+    # Get hyperlinks and email links
+    hyperlinks_col = f'Hyperlinks {section_type}'
+    email_col = f'Link for email - {section_type}'
+    
+    hyperlinks_str = str(mapping_row.get(hyperlinks_col, '')).strip()
+    email_str = str(mapping_row.get(email_col, '')).strip()
+    
+    print(f"Hyperlinks: '{hyperlinks_str}'")
+    print(f"Emails: '{email_str}'")
+    
+    # Parse hyperlinks and emails (semicolon separated)
+    hyperlinks = [h.strip() for h in hyperlinks_str.split(country_delimiter) 
+                 if h.strip() and h.strip().lower() != 'nan']
+    emails = [e.strip() for e in email_str.split(country_delimiter) 
+             if e.strip() and e.strip().lower() != 'nan']
+    
+    print(f"Parsed hyperlinks: {hyperlinks}")
+    print(f"Parsed emails: {emails}")
+    
+    # Sort line columns by number
+    def extract_line_number(col_name):
+        match = re.search(r'Line (\d+)', col_name)
+        return int(match.group(1)) if match else 999
+    
+    sorted_columns = sorted(line_columns, key=extract_line_number)
+    
+    # Find Line 1 to get countries
+    line_1_col = None
+    for col in sorted_columns:
+        if extract_line_number(col) == 1:
+            line_1_col = col
+            break
+    
+    if not line_1_col:
+        print("No Line 1 column found")
+        return components
+    
+    line_1_text = str(mapping_row.get(line_1_col, '')).strip()
+    print(f"Line 1 text: '{line_1_text}'")
+    
+    if not line_1_text or line_1_text.lower() == 'nan':
+        print("Line 1 text is empty")
+        return components
+    
+    # Parse countries using semicolon delimiter
+    countries = [c.strip() for c in line_1_text.split(country_delimiter) if c.strip()]
+    print(f"Countries: {countries}")
+    
+    if not countries:
+        print("No countries found")
+        return components
+    
+    # Process each line
+    for col in sorted_columns:
+        line_num = extract_line_number(col)
+        content = str(mapping_row.get(col, '')).strip()
+        
+        print(f"Processing Line {line_num}: '{content}'")
+        
+        if not content or content.lower() == 'nan':
+            continue
+        
+        # Split content by countries using semicolon delimiter
+        parts = [p.strip() for p in content.split(country_delimiter)]
+        print(f"  Split into parts: {parts}")
+        
+        for i, country in enumerate(countries):
+            if i < len(parts) and parts[i]:
+                text = parts[i]
+                
+                # Determine links for this country position
+                hyperlink = hyperlinks[i] if i < len(hyperlinks) else None
+                email = emails[i] if i < len(emails) else None
+                
+                component = {
+                    'line': line_num,
+                    'country': country,
+                    'text': text,
+                    'hyperlink': hyperlink,
+                    'email': email
+                }
+                
+                components.append(component)
+                print(f"  Added component: {component}")
+    
+    print(f"Total components built: {len(components)}")
+    return components
+
+
+def insert_replacement_simple(para: Paragraph, insertion_point: int, components: List[Dict], 
+                            section_type: str, mapping_row: pd.Series, country_delimiter: str = ";"):
+    """
+    Simplified insertion that adds text at the insertion point.
+    """
+    print(f"\n📝 INSERTING REPLACEMENT at position {insertion_point}")
+    print(f"Components to insert: {len(components)}")
+    
+    # Group components by line
+    lines = {}
+    for comp in components:
+        line_num = comp['line']
+        if line_num not in lines:
+            lines[line_num] = []
+        lines[line_num].append(comp)
+    
+    # Build replacement text
+    replacement_text = ""
+    
+    for line_idx, line_num in enumerate(sorted(lines.keys())):
+        line_components = lines[line_num]
+        
+        # Add line break before non-first lines
+        if line_idx > 0:
+            replacement_text += "\n"
+        
+        # Add components for this line
+        line_texts = []
+        for comp in line_components:
+            text = comp['text']
+            country = comp['country']
+            hyperlink = comp.get('hyperlink')
+            email = comp.get('email')
+            
+            # For now, just add the text (we'll enhance formatting later)
+            component_text = text
+            if hyperlink:
+                component_text += f" {hyperlink}"
+            if email:
+                component_text += f" {email}"
+            
+            line_texts.append(component_text)
+        
+        # Join with semicolon delimiter
+        replacement_text += f"{country_delimiter} ".join(line_texts)
+    
+    # For PL sections, append the additional text
+    if section_type == "PL":
+        additional_text = str(mapping_row.get('Text to be appended after National reporting system PL', '')).strip()
+        if additional_text and additional_text.lower() != 'nan':
+            replacement_text += f"\n\n{additional_text}"
+    
+    print(f"Replacement text: '{replacement_text}'")
+    
+    # Simple insertion - add a new run with the replacement text
+    new_run = para.add_run(replacement_text)
+    print("✅ Replacement text inserted")
+    
+    return True
+
+
 def run_annex_update_v2(doc: Document, mapping_row: pd.Series, section_type: str, 
                        cached_components: Optional[List] = None, 
-                       country_delimiter: str = ", ") -> Tuple[bool, Optional[List]]:
+                       country_delimiter: str = ";") -> Tuple[bool, Optional[List]]:
     """Update national reporting systems in SmPC or PL sections."""
-    
+    # Get the target text to find and replace
     target_col = f'Original text national reporting - {section_type}'
     target_string = str(mapping_row.get(target_col, '')).strip()
     
@@ -434,48 +1183,125 @@ def run_annex_update_v2(doc: Document, mapping_row: pd.Series, section_type: str
     if not target_string or target_string.lower() == 'nan':
         return False, None
 
+    # Get replacement components
     components = get_replacement_components(mapping_row, section_type, cached_components, country_delimiter)
     
     if not components:
         return False, None
     
-    # Find and replace the target text
+    # Find and update the target text
     found = False
     for para in doc.paragraphs:
         if target_string.lower() in para.text.lower():
-            # Clear paragraph and rebuild with components
-            para.clear()
             
-            # Group components by line
-            lines = {}
-            for comp in components:
-                line_num = comp['line']
-                if line_num not in lines:
-                    lines[line_num] = []
-                lines[line_num].append(comp)
+            # Find runs to remove
+            runs_to_remove = find_runs_to_remove(para, target_string)
             
-            # Build replacement text
-            for line_num in sorted(lines.keys()):
-                line_components = lines[line_num]
-                line_texts = []
+            if runs_to_remove:
+                # Remove the identified runs
+                for run in runs_to_remove:
+                    run._element.getparent().remove(run._element)
                 
-                for comp in line_components:
-                    if comp['hyperlink']:
-                        # Add hyperlink (simplified for this implementation)
-                        line_texts.append(f"{comp['text']} ({comp['hyperlink']})")
-                    else:
-                        line_texts.append(comp['text'])
+                # Build and insert replacement text
+                replacement_text = build_replacement_text_by_country(components)
                 
-                line_text = country_delimiter.join(line_texts)
+                # For PL sections, append additional text
+                if section_type == "PL":
+                    additional_text = str(mapping_row.get('Text to be appended after National reporting system PL', '')).strip()
+                    if additional_text and additional_text.lower() != 'nan':
+                        replacement_text += f"\n\n{additional_text}"
                 
-                if line_num > 1:
-                    para.add_run('\n')
-                para.add_run(line_text)
-            
-            found = True
-            break
+                # Insert the replacement
+                para.add_run(replacement_text)
+                
+                found = True
+                break
     
     return found, components
+
+
+def update_document_with_fixed_smpc_blocks(doc: Document, mapping_row: pd.Series) -> Tuple[bool, List[str]]:
+    """
+    Main function to update document with fixed SmPC block handling.
+    
+    This function coordinates the updates for both SmPC and PL sections
+    using the fixed functions that properly handle semicolon delimiters
+    and selective text replacement.
+    """
+    updates_applied = []
+    total_success = False
+    
+    try:
+        # Get the correct country delimiter from config (default to semicolon)
+        country_delimiter = ";"  # This should come from ProcessingConfig
+        
+        # 1. Update SmPC national reporting systems
+        smpc_success, smpc_components = run_annex_update_v2(
+            doc, mapping_row, "SmPC", None, country_delimiter=country_delimiter
+        )
+        if smpc_success:
+            updates_applied.append("SmPC national reporting")
+            total_success = True
+
+        # 2. Update PL national reporting systems
+        pl_success, _ = run_annex_update_v2(
+            doc, mapping_row, "PL", smpc_components if smpc_success else None, country_delimiter=country_delimiter
+        )
+        if pl_success:
+            updates_applied.append("PL national reporting")
+            total_success = True
+        
+        return total_success, updates_applied
+        
+    except Exception as e:
+        raise Exception(f"Failed to apply SmPC block updates: {e}")
+
+
+def handle_pl_additional_text(para: Paragraph, mapping_row: pd.Series) -> bool:
+    """
+    Handle the additional text that needs to be appended after PL national reporting system.
+    
+    This text comes from the "Text to be appended after National reporting system PL" column
+    and provides additional safety reporting information.
+    """
+    additional_text = str(mapping_row.get('Text to be appended after National reporting system PL', '')).strip()
+    
+    if not additional_text or additional_text.lower() == 'nan':
+        return False
+    
+    # Add spacing and the additional text
+    para.add_run('\n\n')
+    
+    # Add the additional text with appropriate formatting
+    additional_run = para.add_run(additional_text)
+    # You can customize formatting here if needed (e.g., italic, different color, etc.)
+    
+    return True
+
+
+def create_pl_replacement_block(mapping_row: pd.Series, country_delimiter: str = ";") -> str:
+    """
+    Create the complete PL replacement block including the main content and additional text.
+    
+    This handles the case where PL uses block format rather than line-by-line format.
+    """
+    # Get main PL content
+    main_content = str(mapping_row.get('National reporting system PL', '')).strip()
+    
+    # Get additional text
+    additional_text = str(mapping_row.get('Text to be appended after National reporting system PL', '')).strip()
+    
+    # Combine them
+    full_content = []
+    
+    if main_content and main_content.lower() != 'nan':
+        full_content.append(main_content)
+    
+    if additional_text and additional_text.lower() != 'nan':
+        full_content.append(additional_text)
+    
+    return '\n\n'.join(full_content) if full_content else ''
+
 
 def update_section_10_date(doc: Document, mapping_row: pd.Series) -> bool:
     """Update date in Annex I Section 10."""
@@ -1517,15 +2343,10 @@ class DocumentUpdater:
         total_success = False
         
         try:
-            # 1. Update national reporting systems
-            smpc_success, smpc_components = run_annex_update_v2(doc, mapping_row, SectionTypes.SMPC)
+            # 1. Update national reporting systems  ⬅️ **REPLACE WITH THIS**
+            smpc_success, smpc_updates = update_document_with_fixed_smpc_blocks(doc, mapping_row)
             if smpc_success:
-                updates_applied.append("SmPC national reporting")
-                total_success = True
-            
-            pl_success, _ = run_annex_update_v2(doc, mapping_row, SectionTypes.PL, smpc_components)
-            if pl_success:
-                updates_applied.append("PL national reporting")
+                updates_applied.extend(smpc_updates)
                 total_success = True
             
             # 2. Update dates
