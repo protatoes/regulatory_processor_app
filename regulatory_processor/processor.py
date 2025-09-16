@@ -1517,6 +1517,79 @@ def validate_relationship_id(document: Document, rel_id: str) -> bool:
 # ============================================================================= 
 # ENHANCED HYPERLINK CREATION - Step 3.4
 # =============================================================================
+def _create_hyperlink_element(para: Paragraph, text: str, url: str, document: Document) -> OxmlElement:
+    """
+    Creates and returns a w:hyperlink OxmlElement without appending it.
+    This allows for surgical insertion.
+    """
+    try:
+        # Step 1: Validate URL
+        format_result = validate_url_format(url)
+        if not format_result.is_valid:
+            raise Exception(f"Invalid URL format: {format_result.error_message}")
+        final_url = format_result.normalized_url or format_result.url
+        
+        # Step 2: Create document relationship
+        rel_id = add_hyperlink_relationship(document, final_url)
+        
+        # Step 3: Create hyperlink XML element
+        hyperlink = OxmlElement('w:hyperlink')
+        hyperlink.set(qn('r:id'), rel_id)
+        
+        # Step 4: Create run within hyperlink
+        run_element = OxmlElement('w:r')
+        run_props = OxmlElement('w:rPr')
+        
+        # Add hyperlink styling (blue color, underline)
+        color = OxmlElement('w:color')
+        color.set(qn('w:val'), '0000FF')
+        run_props.append(color)
+        
+        underline = OxmlElement('w:u')
+        underline.set(qn('w:val'), 'single')
+        run_props.append(underline)
+        
+        run_element.append(run_props)
+        
+        # Add text content
+        text_element = OxmlElement('w:t')
+        text_element.text = text
+        run_element.append(text_element)
+        
+        hyperlink.append(run_element)
+        
+        return hyperlink
+
+    except Exception as e:
+        logging.warning(f"Hyperlink element creation failed for '{url}': {e}. Falling back.")
+        # Return a styled run element instead
+        return _create_styled_text_fallback_element(text)
+
+def _create_styled_text_fallback_element(text: str) -> OxmlElement:
+    """
+    Creates and returns a styled w:r (run) element as a fallback.
+    """
+    run = OxmlElement('w:r')
+    rPr = OxmlElement('w:rPr')
+    
+    # Add blue color
+    color = OxmlElement('w:color')
+    color.set(qn('w:val'), '0000FF')
+    rPr.append(color)
+    
+    # Add underline
+    u = OxmlElement('w:u')
+    u.set(qn('w:val'), 'single')
+    rPr.append(u)
+    
+    run.append(rPr)
+    
+    # Add text
+    t = OxmlElement('w:t')
+    t.text = text
+    run.append(t)
+    
+    return run
 
 def create_hyperlink_run_enhanced(para: Paragraph, text: str, url: str, 
                                  validate_url: bool = True, 
@@ -1782,15 +1855,12 @@ def insert_formatted_replacement_surgically(para: Paragraph, insertion_point: in
                                           document: Document = None):
     """
     Insert properly formatted replacement text at a specific position in the paragraph.
-
-    NEW: Now supports multi-country block separation. Each country gets its own
-    complete block separated by double line breaks (\\n\\n).
+    
+    NEW: Only hyperlinks the specific text that matches the hyperlink/email value.
     """
     # Group components by country first, then by line within each country
     countries = {}
     for comp in components:
-        # Use a tuple of (country, index) as the key to group
-        # This handles the (rare) case of the same country appearing twice
         country_key = (comp['country'], comp.get('country_index', 0))
         line_num = comp['line']
 
@@ -1801,131 +1871,122 @@ def insert_formatted_replacement_surgically(para: Paragraph, insertion_point: in
             countries[country_key]['lines'][line_num] = []
         countries[country_key]['lines'][line_num].append(comp)
 
-    # Sort countries based on their index
     sorted_country_keys = sorted(countries.keys(), key=lambda x: x[1])
 
-    # Insert at the specified position
     current_element = None
     if insertion_point < len(para.runs):
         current_element = para.runs[insertion_point]._element
 
-    first_break_run = para.add_run('\n')
+    # Add a single line break BEFORE the first country block
+    first_break_run_xml = OxmlElement('w:r')
+    first_break_run_xml.append(OxmlElement('w:br'))
+    
     if current_element is not None:
-        current_element.addnext(first_break_run._element)
-        current_element = first_break_run._element
+        current_element.addnext(first_break_run_xml)
+        current_element = first_break_run_xml
     else:
-        # This handles the case where the paragraph was empty
-        current_element = first_break_run._element
-        
+        para._p.append(first_break_run_xml)
+        current_element = first_break_run_xml
+
     # Build replacement text country by country
     for country_idx, country_key in enumerate(sorted_country_keys):
         country_info = countries[country_key]
         lines = country_info['lines']
 
-        # Add double line break before non-first countries (multi-country separation)
         if country_idx > 0:
-            double_break_run = para.add_run('\n\n')
-            if current_element is not None:
-                current_element.addnext(double_break_run._element)
-                current_element = double_break_run._element
+            double_break_run_xml = OxmlElement('w:r')
+            double_break_run_xml.append(OxmlElement('w:br'))
+            double_break_run_xml.append(OxmlElement('w:br'))
+            current_element.addnext(double_break_run_xml)
+            current_element = double_break_run_xml
 
         # Build lines within this country
         for line_idx, line_num in enumerate(sorted(lines.keys())):
             line_components = lines[line_num]
 
-            # Add single line break before non-first lines within same country
             if line_idx > 0:
-                line_break_run = para.add_run('\n')
-                if current_element is not None:
-                    current_element.addnext(line_break_run._element)
-                    current_element = line_break_run._element
+                line_break_run_xml = OxmlElement('w:r')
+                line_break_run_xml.append(OxmlElement('w:br'))
+                current_element.addnext(line_break_run_xml)
+                current_element = line_break_run_xml
 
-            # Process all components for this line
             for comp_idx, comp in enumerate(line_components):
                 text = comp['text']
                 country = comp['country']
                 hyperlink = comp.get('hyperlink')
                 email = comp.get('email')
 
-                # Normalize for comparison
-                text_clean = text.replace("e-mail:", "").replace("Website:", "").strip()
+                # ==========================================================
+                # START: MODIFIED LOGIC
+                # ==========================================================
                 
-                # Check if this component's text is supposed to be an email link
-                is_email_link = email and (email in text_clean or text_clean in email)
-                
-                # Check if this component's text is supposed to be a web link
-                # (and not an email link, which takes precedence)
-                is_hyperlink = not is_email_link and hyperlink and (
-                    hyperlink in text_clean or text_clean in hyperlink
-                )
+                is_email_link = email and email in text
+                is_hyperlink = not is_email_link and hyperlink and hyperlink in text
 
-                # --- 1. RENDER AS EMAIL LINK ---
+                # --- 1. RENDER AS EMAIL LINK (SPLIT) ---
                 if is_email_link:
-                    try:
-                        email_url = f'mailto:{email}' if not email.startswith('mailto:') else email
-                        email_run = create_hyperlink_run_enhanced(
-                            para, text, email_url,  # Use original 'text' as display
-                            validate_url=True, document=document
-                        )
-                        if current_element is not None:
-                            current_element.addnext(email_run._element)
-                            current_element = email_run._element
-                    except Exception as e:
-                        logging.warning(f"Failed to create email link for '{email}': {e}")
-                        fallback_run = _create_styled_text_fallback(para, text)
-                        if current_element is not None:
-                            current_element.addnext(fallback_run._element)
-                            current_element = fallback_run._element
+                    parts = re.split(f'({re.escape(email)})', text, 1)
+                    email_url = f'mailto:{email}' if not email.startswith('mailto:') else email
 
-                # --- 2. RENDER AS HYPERLINK ---
+                    if parts[0]:
+                        text_run = para.add_run(parts[0])
+                        current_element.addnext(text_run._element)
+                        current_element = text_run._element
+                    
+                    link_element = _create_hyperlink_element(para, email, email_url, document)
+                    current_element.addnext(link_element)
+                    current_element = link_element
+
+                    if len(parts) > 2 and parts[2]:
+                        text_run = para.add_run(parts[2])
+                        current_element.addnext(text_run._element)
+                        current_element = text_run._element
+
+                # --- 2. RENDER AS HYPERLINK (SPLIT) ---
                 elif is_hyperlink:
-                    try:
-                        hyperlink_run = create_hyperlink_run_enhanced(
-                            para, text, hyperlink,  # Use original 'text' as display
-                            validate_url=True, document=document
-                        )
-                        if current_element is not None:
-                            current_element.addnext(hyperlink_run._element)
-                            current_element = hyperlink_run._element
-                    except Exception as e:
-                        logging.warning(f"Failed to create hyperlink for '{hyperlink}': {e}")
-                        fallback_run = _create_styled_text_fallback(para, text)
-                        if current_element is not None:
-                            current_element.addnext(fallback_run._element)
-                            current_element = fallback_run._element
+                    parts = re.split(f'({re.escape(hyperlink)})', text, 1)
+                    
+                    if parts[0]:
+                        text_run = para.add_run(parts[0])
+                        current_element.addnext(text_run._element)
+                        current_element = text_run._element
+                    
+                    link_element = _create_hyperlink_element(para, hyperlink, hyperlink, document)
+                    current_element.addnext(link_element)
+                    current_element = link_element
+
+                    if len(parts) > 2 and parts[2]:
+                        text_run = para.add_run(parts[2])
+                        current_element.addnext(text_run._element)
+                        current_element = text_run._element
 
                 # --- 3. RENDER AS PLAIN TEXT (with potential bolding) ---
                 else:
                     if country and country in text:
-                        # Split text to bold only the country name
                         parts = text.split(country, 1)
                         
-                        # Add text before country
                         if parts[0]:
                             text_run = para.add_run(parts[0])
-                            if current_element is not None:
-                                current_element.addnext(text_run._element)
-                                current_element = text_run._element
-                        
-                        # Add bolded country name
-                        country_run = para.add_run(country)
-                        country_run.bold = True
-                        if current_element is not None:
-                            current_element.addnext(country_run._element)
-                            current_element = country_run._element
-                        
-                        # Add text after country
-                        if len(parts) > 1 and parts[1]:
-                            remaining_run = para.add_run(parts[1])
-                            if current_element is not None:
-                                current_element.addnext(remaining_run._element)
-                                current_element = remaining_run._element
-                    else:
-                        text_run = para.add_run(text)
-                        if current_element is not None:
                             current_element.addnext(text_run._element)
                             current_element = text_run._element
-
+                        
+                        country_run = para.add_run(country)
+                        country_run.bold = True
+                        current_element.addnext(country_run._element)
+                        current_element = country_run._element
+                        
+                        if len(parts) > 1 and parts[1]:
+                            remaining_run = para.add_run(parts[1])
+                            current_element.addnext(remaining_run._element)
+                            current_element = remaining_run._element
+                    else:
+                        text_run = para.add_run(text)
+                        current_element.addnext(text_run._element)
+                        current_element = text_run._element
+                
+                # ==========================================================
+                # END: MODIFIED LOGIC
+                # ==========================================================
 
 
 def debug_paragraph_structure(para: Paragraph, target_string: str):
