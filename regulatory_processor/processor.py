@@ -19,6 +19,8 @@ import os
 import re
 import shutil
 import logging
+import locale
+import calendar
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, NamedTuple, Union
 from dataclasses import dataclass
@@ -107,64 +109,217 @@ class ProcessingConfig:
 # =============================================================================
 
 class DateFormatterSystem:
-    """Enhanced date formatting system with locale support."""
+    """
+    A system for formatting dates based on country-specific formats defined in a mapping table.
+    Supports locale-specific month names and custom static text.
+    """
     
     def __init__(self, mapping_file_path: str):
+        """
+        Initialize the date formatter with a mapping file.
+        
+        Args:
+            mapping_file_path: Path to the Excel mapping file
+        """
         self.mapping_df = pd.read_excel(mapping_file_path)
         self.country_formats = self._load_country_formats()
+        self.locale_mapping = self._create_locale_mapping()
         
     def _load_country_formats(self) -> Dict[str, Dict[str, str]]:
         """Load date formats from the mapping table."""
         formats = {}
+        
         for _, row in self.mapping_df.iterrows():
             country = row['Country']
+            annex_i_format = row.get('Annex I Date Format', '')
+            annex_iiib_format = row.get('Annex IIIB Date Format', '')
+            
             formats[country] = {
-                'annex_i': row.get('Annex I Date Format', ''),
-                'annex_iiib': row.get('Annex IIIB Date Format', '')
+                'annex_i': annex_i_format,
+                'annex_iiib': annex_iiib_format
             }
+            
         return formats
     
-    def format_date(self, date: datetime, country: str, annex_type: str) -> str:
-        """Format a date according to country specifications."""
-        if country not in self.country_formats:
-            return date.strftime("%d %B %Y")  # Default format
-            
-        format_string = self.country_formats[country].get(annex_type, '')
-        return self._parse_custom_format(date, format_string)
+    def _create_locale_mapping(self) -> Dict[str, str]:
+        """
+        Create a mapping between countries and their locale codes.
+        This helps with getting proper month names.
+        """
+        locale_map = {
+            'België/Nederland': 'nl_NL.UTF-8',
+            'Belgique/Luxembourg': 'fr_FR.UTF-8', 
+            'Belgien/Luxemburg': 'de_DE.UTF-8',
+            'Estonia': 'et_EE.UTF-8',
+            'Greece/Cyprus': 'el_GR.UTF-8',
+            'Latvia': 'lv_LV.UTF-8',
+            'Lithuania': 'lt_LT.UTF-8',
+            'Portugal': 'pt_PT.UTF-8',
+            'Croatia': 'hr_HR.UTF-8',
+            'Slovenia': 'sl_SI.UTF-8',
+            'Finland': 'fi_FI.UTF-8',
+            'Sweden/Finland': 'sv_SE.UTF-8',
+            'Germany/Österreich': 'de_DE.UTF-8',
+            'Italy': 'it_IT.UTF-8',
+            'Spain': 'es_ES.UTF-8',
+            'Ireland/Malta': 'en_IE.UTF-8',
+            'Malta': 'mt_MT.UTF-8',
+            'France': 'fr_FR.UTF-8',
+            'Denmark': 'da_DK.UTF-8',
+            'Iceland': 'is_IS.UTF-8',
+            'Norway': 'no_NO.UTF-8',
+            'Czech Republic': 'cs_CZ.UTF-8',
+            'Poland': 'pl_PL.UTF-8',
+            'Slovakia': 'sk_SK.UTF-8',
+            'Bulgaria': 'bg_BG.UTF-8',
+            'Hungary': 'hu_HU.UTF-8',
+            'Romania': 'ro_RO.UTF-8',
+        }
+        return locale_map
     
-    def _parse_custom_format(self, date: datetime, format_string: str) -> str:
-        """Parse custom format string and return formatted date."""
-        if not format_string or format_string.lower() == 'nan':
-            return date.strftime("%d %B %Y")
+    def _get_month_name(self, date: datetime, country: str, format_type: str) -> str:
+        """
+        Get the month name in the appropriate language and case for the country.
         
-        # Handle common patterns
-        if format_string == "dd month yyyy":
-            return date.strftime("%d %B %Y")
-        elif format_string == "month yyyy":
-            return date.strftime("%B %Y")
-        elif format_string == "dd. MMM yyyy":
-            return date.strftime("%d. %b %Y")
-        elif format_string == "MMM yyyy":
-            return date.strftime("%b %Y")
-        else:
-            return date.strftime("%d %B %Y")
+        Args:
+            date: The date object
+            country: Country name
+            format_type: The format string to determine case
+            
+        Returns:
+            Formatted month name
+        """
+        try:
+            # Set locale for the country
+            country_locale = self.locale_mapping.get(country, 'en_US.UTF-8')
+            
+            # Try to set the locale, fall back to English if not available
+            try:
+                locale.setlocale(locale.LC_TIME, country_locale)
+            except locale.Error:
+                locale.setlocale(locale.LC_TIME, 'en_US.UTF-8')
+            
+            # Determine the case based on format
+            if 'Month' in format_type:  # Capital M
+                month_name = date.strftime('%B')  # Full month name
+            elif 'MMM' in format_type:  # Three letter abbreviation
+                month_name = date.strftime('%b')  # Abbreviated month name
+            else:  # 'month' - lowercase
+                month_name = date.strftime('%B').lower()
+                
+            return month_name
+            
+        except Exception:
+            # Fallback to English month names
+            month_names = {
+                'Month': date.strftime('%B'),
+                'month': date.strftime('%B').lower(), 
+                'MMM': date.strftime('%b')
+            }
+            
+            if 'Month' in format_type:
+                return month_names['Month']
+            elif 'MMM' in format_type:
+                return month_names['MMM']
+            else:
+                return month_names['month']
+    
+    def _parse_custom_format(self, date: datetime, format_string: str, country: str) -> str:
+        """
+        Parse a custom format string and return the formatted date.
+        
+        Args:
+            date: The date to format
+            format_string: Custom format string from mapping table
+            country: Country name for locale-specific formatting
+            
+        Returns:
+            Formatted date string
+        """
+        if not format_string:
+            return ""
+            
+        result = format_string
+        
+        # Handle year formats
+        result = re.sub(r'yyyy', str(date.year), result)
+        
+        # Handle month formats (do this before day to avoid conflicts)
+        month_name = self._get_month_name(date, country, format_string)
+        result = re.sub(r'Month|month|MMM', month_name, result)
+        
+        # Handle numeric month formats
+        result = re.sub(r'mm', f"{date.month:02d}", result)
+        result = re.sub(r'MM', f"{date.month:02d}", result)
+        
+        # Handle day formats  
+        result = re.sub(r'dd', f"{date.day:02d}", result)
+        result = re.sub(r'(?<!d)d\.', f"{date.day}.", result)  # Handle single d followed by dot
+        
+        return result.strip()
+    
+    def format_date(self, date: datetime, country: str, annex_type: str) -> str:
+        """
+        Format a date according to the country's specified format for the given annex.
+        
+        Args:
+            date: The date to format
+            country: Country name (must match mapping table)
+            annex_type: Either 'annex_i' or 'annex_iiib'
+            
+        Returns:
+            Formatted date string
+            
+        Raises:
+            ValueError: If country or annex_type is not found
+        """
+        if country not in self.country_formats:
+            raise ValueError(f"Country '{country}' not found in mapping table")
+            
+        if annex_type not in ['annex_i', 'annex_iiib']:
+            raise ValueError("annex_type must be 'annex_i' or 'annex_iiib'")
+            
+        format_string = self.country_formats[country][annex_type]
+        return self._parse_custom_format(date, format_string, country)
     
     def get_available_countries(self) -> List[str]:
-        """Get list of available countries."""
+        """Get list of available countries in the mapping table."""
         return list(self.country_formats.keys())
     
+    def get_country_formats(self, country: str) -> Dict[str, str]:
+        """Get both annex formats for a specific country."""
+        if country not in self.country_formats:
+            raise ValueError(f"Country '{country}' not found in mapping table")
+        return self.country_formats[country]
+    
     def preview_format(self, country: str, sample_date: datetime = None) -> Dict[str, str]:
-        """Preview date formatting for a country."""
+        """
+        Preview how dates will be formatted for a country.
+        
+        Args:
+            country: Country name
+            sample_date: Date to use for preview (defaults to current date)
+            
+        Returns:
+            Dictionary with formatted examples for both annexes
+        """
         if sample_date is None:
             sample_date = datetime.now()
-        
-        if country not in self.country_formats:
-            return {'error': f'Country {country} not found'}
-        
-        return {
-            'annex_i_example': self.format_date(sample_date, country, 'annex_i'),
-            'annex_iiib_example': self.format_date(sample_date, country, 'annex_iiib')
-        }
+            
+        try:
+            annex_i_formatted = self.format_date(sample_date, country, 'annex_i')
+            annex_iiib_formatted = self.format_date(sample_date, country, 'annex_iiib')
+            
+            return {
+                'country': country,
+                'sample_date': sample_date.strftime('%Y-%m-%d'),
+                'annex_i_format': self.country_formats[country]['annex_i'],
+                'annex_i_example': annex_i_formatted,
+                'annex_iiib_format': self.country_formats[country]['annex_iiib'],
+                'annex_iiib_example': annex_iiib_formatted
+            }
+        except Exception as e:
+            return {'error': str(e)}
 
 # Global date formatter instance
 _date_formatter: Optional[DateFormatterSystem] = None
@@ -183,15 +338,65 @@ def get_date_formatter() -> DateFormatterSystem:
     return _date_formatter
 
 def format_date_for_country(country: str, annex_type: str, date: Optional[datetime] = None) -> str:
-    """Format a date using the enhanced date formatter."""
+    """
+    Format a date using the enhanced DateFormatterSystem.
+    
+    Args:
+        country: Country name from mapping table
+        annex_type: Either 'annex_i' or 'annex_iiib'
+        date: Date to format (defaults to current date)
+        
+    Returns:
+        Formatted date string
+    """
     if date is None:
         date = datetime.now()
     
     try:
         formatter = get_date_formatter()
         return formatter.format_date(date, country, annex_type)
-    except Exception:
-        return date.strftime("%d %B %Y")  # Fallback
+    except Exception as e:
+        print(f"⚠️ Error formatting date for {country} ({annex_type}): {e}")
+        # Fallback to simple formatting
+        return date.strftime("%d %B %Y")
+
+def format_date(date_format_str: str) -> str:
+    """
+    Legacy format_date function for backward compatibility.
+    This function is deprecated - use format_date_for_country instead.
+    
+    Examples:
+    - "dd month yyyy" -> "12 August 2025"
+    - "month yyyy" -> "August 2025"
+    - "dd. MMM yyyy" -> "12. Aug 2025"
+    - "MMM yyyy" -> "Aug 2025"
+    """
+    now = datetime.now()
+    
+    # Map format patterns to strftime codes
+    if not date_format_str or date_format_str.lower() == 'nan':
+        return ""
+    
+    # Handle various date formats
+    date_format_str = date_format_str.strip()
+    
+    if date_format_str == "dd month yyyy":
+        return now.strftime("%d %B %Y")
+    elif date_format_str == "month yyyy":
+        return now.strftime("%B %Y")
+    elif date_format_str == "Month yyyy":
+        return now.strftime("%B %Y")
+    elif date_format_str == "dd. MMM yyyy":
+        return now.strftime("%d. %b %Y")
+    elif date_format_str == "MMM yyyy":
+        return now.strftime("%b %Y")
+    elif date_format_str == "dd/mm/yyyy":
+        return now.strftime("%d/%m/%Y")
+    elif date_format_str == "dd.mm.yyyy":
+        return now.strftime("%d.%m.%Y")
+    else:
+        # Default format
+        return now.strftime("%d %B %Y")
 
 # ============================================================================= 
 # CORE UTILITY FUNCTIONS
@@ -293,17 +498,49 @@ def generate_output_filename(base_name: str, language: str, country: str, doc_ty
         return f"{base_name}_{doc_type}.docx"
 
 def convert_to_pdf(doc_path: str, output_dir: str) -> str:
-    """Convert a Word document to PDF with multiple fallback methods."""
-    pdf_output_path = Path(output_dir) / Path(doc_path).with_suffix(".pdf").name
+    """Convert a Word document to PDF with multiple fallback methods and timeout protection."""
+    import subprocess
+    import signal
+    import time
+    from pathlib import Path
     
-    # Method 1: Try docx2pdf (primary method)
+    pdf_output_path = Path(output_dir) / Path(doc_path).with_suffix(".pdf").name
+    print(f"   🔄 Converting: {Path(doc_path).name} → {pdf_output_path.name}")
+    
+    # Method 1: Try docx2pdf with timeout protection (primary method)
+    print(f"   📝 Method 1: Attempting docx2pdf conversion...")
     try:
-        convert(doc_path, str(pdf_output_path))
-        return str(pdf_output_path)
+        # Use subprocess to run docx2pdf with timeout control
+        conversion_script = f'''
+import sys
+from docx2pdf import convert
+import time
+start_time = time.time()
+try:
+    convert("{doc_path}", "{pdf_output_path}")
+    print(f"Conversion completed in {{time.time() - start_time:.2f}} seconds")
+except Exception as e:
+    print(f"Conversion failed: {{e}}")
+    sys.exit(1)
+'''
+        
+        result = subprocess.run([
+            'python', '-c', conversion_script
+        ], capture_output=True, text=True, timeout=30)  # 30-second timeout
+        
+        if result.returncode == 0 and pdf_output_path.exists():
+            print(f"   ✅ docx2pdf conversion successful")
+            return str(pdf_output_path)
+        else:
+            print(f"   ⚠️ docx2pdf conversion failed: {result.stderr}")
+            
+    except subprocess.TimeoutExpired:
+        print(f"   ⚠️ docx2pdf conversion timed out after 30 seconds")
     except Exception as e:
-        print(f"   ⚠️ docx2pdf conversion failed: {e}")
+        print(f"   ⚠️ docx2pdf error: {e}")
     
     # Method 2: Try LibreOffice (if available)
+    print(f"   🐧 Method 2: Attempting LibreOffice conversion...")
     try:
         result = subprocess.run([
             'libreoffice', '--headless', '--convert-to', 'pdf',
@@ -318,7 +555,23 @@ def convert_to_pdf(doc_path: str, output_dir: str) -> str:
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         print(f"   ⚠️ LibreOffice not available: {e}")
     
-    # Method 3: Create a placeholder PDF (last resort)
+    # Method 3: Try pandoc (if available)
+    print(f"   📚 Method 3: Attempting pandoc conversion...")
+    try:
+        result = subprocess.run([
+            'pandoc', doc_path, '-o', str(pdf_output_path)
+        ], capture_output=True, text=True, timeout=30)
+        
+        if result.returncode == 0 and pdf_output_path.exists():
+            print(f"   ✅ pandoc conversion successful")
+            return str(pdf_output_path)
+        else:
+            print(f"   ⚠️ pandoc conversion failed: {result.stderr}")
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        print(f"   ⚠️ pandoc not available: {e}")
+    
+    # Method 4: Create a placeholder PDF (last resort)
+    print(f"   📄 Method 4: Creating placeholder file...")
     try:
         # Create a simple text file indicating conversion failed
         placeholder_path = pdf_output_path.with_suffix('.pdf.txt')
@@ -404,6 +657,61 @@ def is_run_gray_shaded(run: Run) -> bool:
     return False
 
 
+def is_run_gray_shaded_enhanced(run: Run) -> bool:
+    """Enhanced gray shading detection with comprehensive color matching."""
+    try:
+        # First use the original method
+        if is_run_gray_shaded(run):
+            return True
+
+        # Check run properties for shading with more extensive color list
+        run_pr = run._element.get_or_add_rPr()
+        shading_elements = run_pr.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}shd')
+
+        if shading_elements:
+            for shading in shading_elements:
+                fill = shading.get(qn('w:fill'))
+                if fill:
+                    # Extended gray color list in hex format
+                    gray_hex_colors = [
+                        'd9d9d9', 'cccccc', 'c0c0c0', 'bfbfbf', 'b3b3b3', 'a0a0a0',
+                        '999999', '808080', '666666', '606060', 'f5f5f5', 'e0e0e0',
+                        'lightgray', 'gray', 'darkgray', 'auto'
+                    ]
+                    if fill.lower() in gray_hex_colors:
+                        return True
+
+        # Enhanced font color checking with more gray variations
+        if run.font.color and hasattr(run.font.color, 'rgb') and run.font.color.rgb is not None:
+            color = run.font.color.rgb
+            # Expanded gray color list
+            gray_colors = [
+                # Original grays
+                RGBColor(128, 128, 128), RGBColor(153, 153, 153),
+                RGBColor(102, 102, 102), RGBColor(96, 96, 96),
+                RGBColor(217, 217, 217), RGBColor(191, 191, 191),
+                # Additional gray variations
+                RGBColor(160, 160, 160), RGBColor(192, 192, 192),
+                RGBColor(224, 224, 224), RGBColor(245, 245, 245),
+                RGBColor(179, 179, 179), RGBColor(140, 140, 140),
+                RGBColor(112, 112, 112), RGBColor(75, 75, 75)
+            ]
+
+            # Check for exact matches
+            if color in gray_colors:
+                return True
+
+            # Check if color components are approximately equal (indicating gray)
+            if abs(color.r - color.g) < 20 and abs(color.g - color.b) < 20 and abs(color.r - color.b) < 20:
+                # It's some shade of gray
+                return True
+
+    except Exception as e:
+        print(f"Warning: Gray shading detection failed: {e}")
+
+    return False
+
+
 def is_run_hyperlink(run: Run) -> bool:
     """Check if a run is part of a hyperlink."""
     try:
@@ -420,6 +728,115 @@ def is_run_hyperlink(run: Run) -> bool:
     except Exception:
         pass
     
+    return False
+
+
+def is_run_hyperlink_enhanced(run: Run) -> bool:
+    """Enhanced hyperlink detection with comprehensive checks."""
+    try:
+        # First use the original method
+        if is_run_hyperlink(run):
+            return True
+
+        # Enhanced XML-based hyperlink detection
+        run_xml = run._r
+
+        # Check multiple possible hyperlink XML patterns
+        hyperlink_patterns = [
+            './/w:hyperlink',
+            './/*[@w:anchor]',  # Internal links
+            './/*[@r:id]',      # External links with relationship ID
+            './/w:instrText',   # Field codes (can contain hyperlinks)
+        ]
+
+        for pattern in hyperlink_patterns:
+            try:
+                elements = run_xml.xpath(pattern)
+                if elements:
+                    return True
+            except:
+                continue
+
+        # Enhanced styling-based detection
+        if run.font.color and hasattr(run.font.color, 'rgb') and run.font.color.rgb is not None:
+            color = run.font.color.rgb
+
+            # Common hyperlink colors
+            hyperlink_colors = [
+                RGBColor(0, 0, 255),    # Standard blue
+                RGBColor(0, 0, 238),    # Slightly different blue
+                RGBColor(5, 99, 193),   # Word default hyperlink blue
+                RGBColor(17, 85, 204),  # Google Docs blue
+                RGBColor(70, 120, 180), # Alternative blue
+            ]
+
+            # Check for hyperlink colors with or without underline
+            if color in hyperlink_colors:
+                return True
+
+            # Check for blue-ish colors that might be hyperlinks
+            if color.r < 100 and color.g < 150 and color.b > 150:
+                return True
+
+        # Check if run has underline (common for hyperlinks)
+        if run.underline and run.font.color:
+            return True
+
+        # Check if text looks like a URL
+        text = run.text.strip().lower()
+        if any(url_start in text for url_start in ['http://', 'https://', 'www.', 'mailto:']):
+            return True
+
+    except Exception as e:
+        print(f"Warning: Hyperlink detection failed: {e}")
+
+    return False
+
+
+def _is_old_reporting_run(run: Run, target_string: str) -> bool:
+    """Check if a run matches patterns typical of old national reporting text."""
+    try:
+        text = run.text.strip()
+        if not text:
+            return False
+
+        # Common patterns in old national reporting systems
+        old_reporting_patterns = [
+            'adverse',
+            'reaction',
+            'reporting',
+            'national',
+            'system',
+            'side effect',
+            'suspected',
+            'medicine',
+            'drug',
+            'authority',
+            'agency'
+        ]
+
+        text_lower = text.lower()
+        target_lower = target_string.lower()
+
+        # Check if text contains multiple old reporting keywords
+        keyword_count = sum(1 for pattern in old_reporting_patterns if pattern in text_lower)
+        if keyword_count >= 2:
+            return True
+
+        # Check if text is part of the target string
+        if len(text) > 5 and text_lower in target_lower:
+            return True
+
+        # Check if text contains parts of target string
+        target_words = target_lower.split()
+        text_words = text_lower.split()
+        matching_words = len(set(target_words) & set(text_words))
+        if matching_words > 0 and len(text_words) <= 10:  # Short text with target words
+            return True
+
+    except Exception:
+        pass
+
     return False
 
 
@@ -486,41 +903,60 @@ def find_target_text_range(para: Paragraph, target_string: str) -> Tuple[int, in
 
 
 def find_runs_to_remove(para: Paragraph, target_string: str) -> List[Run]:
-    """Find runs that should be removed (gray shaded, hyperlinks, or target text)."""
+    """Find runs that should be removed - ONLY the gray shaded target text from mapping.
+
+    Conservative approach: Only remove runs that contain the exact target text
+    from 'Original text national reporting - SmPC' column AND are gray shaded or hyperlinked.
+    """
     runs_to_remove = []
-    
-    target_start, target_end = find_target_text_range(para, target_string)
-    
-    if target_start == -1:
+
+    if not target_string.strip():
         return runs_to_remove
-    
+
+    print(f"\n🎯 CONSERVATIVE TEXT REMOVAL")
+    print(f"Looking for exact target: '{target_string}'")
+    print(f"Paragraph text: '{para.text}'")
+
+    # Only look for the exact target text
+    target_start, target_end = find_target_text_range(para, target_string)
+
+    if target_start == -1:
+        print(f"❌ Target text not found in paragraph - nothing to remove")
+        return runs_to_remove
+
+    print(f"✅ Target found at position {target_start}-{target_end}")
+
     # Map character positions to runs
     char_pos = 0
     run_ranges = []
-    
+
     for run in para.runs:
         run_start = char_pos
         run_end = char_pos + len(run.text)
         run_ranges.append((run, run_start, run_end))
         char_pos = run_end
-    
-    # Find runs to remove
-    for run, run_start, run_end in run_ranges:
-        should_remove = False
-        
+
+    # Only remove runs that overlap with the target text AND are styled (gray/hyperlink)
+    for i, (run, run_start, run_end) in enumerate(run_ranges):
         # Check if run overlaps with target range
         if run_start < target_end and run_end > target_start:
-            should_remove = True
-        # Check if it's gray shaded
-        elif is_run_gray_shaded(run):
-            should_remove = True
-        # Check if it's a hyperlink
-        elif is_run_hyperlink(run):
-            should_remove = True
-        
-        if should_remove:
-            runs_to_remove.append(run)
-    
+            # Only remove if it's actually gray shaded or a hyperlink
+            is_gray = is_run_gray_shaded(run)
+            is_hyperlink = is_run_hyperlink(run)
+
+            if is_gray or is_hyperlink or run.text.strip() in target_string:
+                runs_to_remove.append(run)
+                reasons = []
+                if is_gray: reasons.append("gray shaded")
+                if is_hyperlink: reasons.append("hyperlink")
+                if run.text.strip() in target_string: reasons.append("contains target text")
+                print(f"  ✅ REMOVING Run {i}: '{run.text}' - {', '.join(reasons)}")
+            else:
+                print(f"  ⏭️  KEEPING Run {i}: '{run.text}' - not styled")
+        else:
+            print(f"  ⏭️  KEEPING Run {i}: '{run.text}' - outside target range")
+
+    print(f"\n🗑️  Will remove {len(runs_to_remove)} runs out of {len(run_ranges)} total")
     return runs_to_remove
 
 
@@ -553,21 +989,592 @@ def find_gray_and_hyperlink_runs(para: Paragraph, target_string: str) -> List[Ru
     return runs_to_remove
 
 
-def create_hyperlink_run(para: Paragraph, text: str, url: str) -> Run:
+# OLD BROKEN IMPLEMENTATION - REMOVED IN STEP 3.4
+# The create_hyperlink_run function has been moved to Step 3.4 section with proper implementation
+# This broken version used w:anchor instead of proper document relationships
+
+
+# ============================================================================= 
+# URL VALIDATION AND HYPERLINK UTILITIES - Priority 3 Implementation
+# =============================================================================
+
+from dataclasses import dataclass
+from typing import Optional
+import re
+import urllib.parse
+
+@dataclass
+class URLValidationResult:
+    """Result of URL format validation."""
+    is_valid: bool
+    url: str
+    protocol: str
+    error_message: Optional[str] = None
+    normalized_url: Optional[str] = None
+
+
+def validate_url_format(url: str) -> URLValidationResult:
     """
-    Create a proper hyperlink run in the paragraph.
+    Validate URL format and return detailed validation results.
+    
+    Supports http/https/mailto protocols as required by the manual process.
+    Handles edge cases like missing protocols and malformed URLs.
+    
+    Args:
+        url: URL string to validate
+    
+    Returns:
+        URLValidationResult with validation status and details
+    """
+    if not url or not isinstance(url, str):
+        return URLValidationResult(
+            is_valid=False,
+            url=url or "",
+            protocol="",
+            error_message="URL is empty or not a string"
+        )
+    
+    # Clean up the URL
+    cleaned_url = url.strip()
+    if not cleaned_url:
+        return URLValidationResult(
+            is_valid=False,
+            url=url,
+            protocol="",
+            error_message="URL is empty after cleaning"
+        )
+    
+    # Check for mailto links
+    if cleaned_url.lower().startswith('mailto:'):
+        return _validate_mailto_url(cleaned_url)
+    
+    # Check for web URLs
+    if cleaned_url.lower().startswith(('http://', 'https://')):
+        return _validate_web_url(cleaned_url)
+    
+    # Try to auto-detect and fix common issues
+    return _auto_fix_url_format(cleaned_url)
+
+
+def _validate_mailto_url(url: str) -> URLValidationResult:
+    """Validate mailto URL format."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme.lower() != 'mailto':
+            return URLValidationResult(
+                is_valid=False,
+                url=url,
+                protocol="mailto",
+                error_message="Invalid mailto scheme"
+            )
+        
+        # Basic email validation
+        email_part = parsed.path
+        if not email_part or '@' not in email_part:
+            return URLValidationResult(
+                is_valid=False,
+                url=url,
+                protocol="mailto",
+                error_message="Invalid email address in mailto URL"
+            )
+        
+        # Simple email regex validation
+        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        if not re.match(email_pattern, email_part):
+            return URLValidationResult(
+                is_valid=False,
+                url=url,
+                protocol="mailto",
+                error_message=f"Invalid email format: {email_part}"
+            )
+        
+        return URLValidationResult(
+            is_valid=True,
+            url=url,
+            protocol="mailto",
+            normalized_url=url.lower()
+        )
+        
+    except Exception as e:
+        return URLValidationResult(
+            is_valid=False,
+            url=url,
+            protocol="mailto",
+            error_message=f"Error parsing mailto URL: {str(e)}"
+        )
+
+
+def _validate_web_url(url: str) -> URLValidationResult:
+    """Validate web URL format (http/https)."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        
+        if parsed.scheme.lower() not in ('http', 'https'):
+            return URLValidationResult(
+                is_valid=False,
+                url=url,
+                protocol=parsed.scheme or "unknown",
+                error_message=f"Unsupported protocol: {parsed.scheme}"
+            )
+        
+        if not parsed.netloc:
+            return URLValidationResult(
+                is_valid=False,
+                url=url,
+                protocol=parsed.scheme,
+                error_message="Missing domain name"
+            )
+        
+        # Check for valid domain format
+        domain_pattern = r'^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$'
+        if not re.match(domain_pattern, parsed.netloc.split(':')[0]):  # Remove port if present
+            return URLValidationResult(
+                is_valid=False,
+                url=url,
+                protocol=parsed.scheme,
+                error_message=f"Invalid domain format: {parsed.netloc}"
+            )
+        
+        return URLValidationResult(
+            is_valid=True,
+            url=url,
+            protocol=parsed.scheme,
+            normalized_url=url
+        )
+        
+    except Exception as e:
+        return URLValidationResult(
+            is_valid=False,
+            url=url,
+            protocol="unknown",
+            error_message=f"Error parsing web URL: {str(e)}"
+        )
+
+
+def _auto_fix_url_format(url: str) -> URLValidationResult:
+    """
+    Attempt to auto-fix common URL format issues.
+    
+    Common fixes:
+    - Add https:// to URLs that look like websites
+    - Detect email addresses and add mailto:
+    """
+    # Check if it looks like an email address
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if re.match(email_pattern, url):
+        fixed_url = f"mailto:{url}"
+        return _validate_mailto_url(fixed_url)
+    
+    # Check if it looks like a website (contains domain-like structure)
+    web_pattern = r'^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(/.*)?$'
+    if re.match(web_pattern, url):
+        # Try https first (more secure)
+        fixed_url = f"https://{url}"
+        result = _validate_web_url(fixed_url)
+        if result.is_valid:
+            result.normalized_url = fixed_url
+            return result
+        
+        # Fallback to http
+        fixed_url = f"http://{url}"
+        result = _validate_web_url(fixed_url)
+        if result.is_valid:
+            result.normalized_url = fixed_url
+            return result
+    
+    # Unable to auto-fix
+    return URLValidationResult(
+        is_valid=False,
+        url=url,
+        protocol="unknown",
+        error_message=f"Unable to determine URL format. Expected http://, https://, or mailto: format"
+    )
+
+
+def validate_urls_batch(urls: List[str]) -> Dict[str, URLValidationResult]:
+    """
+    Validate multiple URLs in batch and return results.
+    
+    Args:
+        urls: List of URL strings to validate
+    
+    Returns:
+        Dictionary mapping original URLs to their validation results
+    """
+    results = {}
+    for url in urls:
+        results[url] = validate_url_format(url)
+    return results
+
+
+# ============================================================================= 
+# URL ACCESSIBILITY TESTING - Step 3.2 (Optional)
+# =============================================================================
+
+import requests
+from typing import NamedTuple
+
+@dataclass
+class URLAccessibilityResult:
+    """Result of URL accessibility testing."""
+    is_accessible: bool
+    url: str
+    status_code: Optional[int] = None
+    response_time_ms: Optional[int] = None
+    error_message: Optional[str] = None
+    redirect_url: Optional[str] = None
+
+
+def test_url_accessibility(url: str, timeout: int = 5, allow_redirects: bool = True) -> URLAccessibilityResult:
+    """
+    Test if a URL is accessible via HTTP request.
+    
+    This is optional functionality that can be enabled/disabled via configuration.
+    Useful for validating that hyperlinks actually work before inserting them.
+    
+    Args:
+        url: URL to test
+        timeout: Request timeout in seconds (default: 5)
+        allow_redirects: Whether to follow redirects (default: True)
+    
+    Returns:
+        URLAccessibilityResult with accessibility status and details
+    """
+    # Skip accessibility testing for mailto URLs
+    if url.lower().startswith('mailto:'):
+        return URLAccessibilityResult(
+            is_accessible=True,  # Assume mailto is accessible if format is valid
+            url=url,
+            status_code=None,
+            error_message="Mailto URLs are not tested for accessibility"
+        )
+    
+    try:
+        import time
+        start_time = time.time()
+        
+        # Make HTTP request
+        response = requests.head(url, timeout=timeout, allow_redirects=allow_redirects)
+        
+        end_time = time.time()
+        response_time_ms = int((end_time - start_time) * 1000)
+        
+        # Check if request was successful
+        is_accessible = response.status_code < 400
+        
+        result = URLAccessibilityResult(
+            is_accessible=is_accessible,
+            url=url,
+            status_code=response.status_code,
+            response_time_ms=response_time_ms
+        )
+        
+        # Check for redirects
+        if response.history:
+            result.redirect_url = response.url
+        
+        if not is_accessible:
+            result.error_message = f"HTTP {response.status_code}: {response.reason}"
+        
+        return result
+        
+    except requests.exceptions.Timeout:
+        return URLAccessibilityResult(
+            is_accessible=False,
+            url=url,
+            error_message=f"Request timed out after {timeout} seconds"
+        )
+    
+    except requests.exceptions.ConnectionError as e:
+        return URLAccessibilityResult(
+            is_accessible=False,
+            url=url,
+            error_message=f"Connection error: {str(e)}"
+        )
+    
+    except requests.exceptions.RequestException as e:
+        return URLAccessibilityResult(
+            is_accessible=False,
+            url=url,
+            error_message=f"Request failed: {str(e)}"
+        )
+    
+    except Exception as e:
+        return URLAccessibilityResult(
+            is_accessible=False,
+            url=url,
+            error_message=f"Unexpected error: {str(e)}"
+        )
+
+
+def test_urls_accessibility_batch(urls: List[str], timeout: int = 5, 
+                                max_concurrent: int = 5) -> Dict[str, URLAccessibilityResult]:
+    """
+    Test multiple URLs for accessibility in batch with optional concurrency.
+    
+    Args:
+        urls: List of URLs to test
+        timeout: Request timeout in seconds per URL
+        max_concurrent: Maximum concurrent requests (default: 5)
+    
+    Returns:
+        Dictionary mapping URLs to their accessibility results
+    """
+    results = {}
+    
+    # For now, implement sequential testing (can be enhanced with threading later)
+    for url in urls:
+        results[url] = test_url_accessibility(url, timeout)
+    
+    return results
+
+
+@dataclass 
+class URLValidationConfig:
+    """Configuration for URL validation and testing."""
+    enable_format_validation: bool = True
+    enable_accessibility_testing: bool = False  # Disabled by default
+    accessibility_timeout: int = 5
+    max_concurrent_tests: int = 5
+    auto_fix_urls: bool = True
+    
+
+@dataclass
+class HyperlinkProcessingConfig:
+    """Configuration for hyperlink processing in document updates."""
+    enable_enhanced_hyperlinks: bool = True  # Use new hyperlink system
+    enable_url_validation: bool = True  # Validate URLs before creating hyperlinks
+    fallback_to_styled_text: bool = True  # Create styled text if hyperlinks fail
+    log_hyperlink_errors: bool = True  # Log hyperlink creation errors
+    url_validation_config: URLValidationConfig = None
+    
+    def __post_init__(self):
+        if self.url_validation_config is None:
+            self.url_validation_config = URLValidationConfig()
+    
+
+def validate_and_test_url_complete(url: str, config: URLValidationConfig = None) -> tuple[URLValidationResult, Optional[URLAccessibilityResult]]:
+    """
+    Complete URL validation including both format and accessibility testing.
+    
+    Args:
+        url: URL to validate and test
+        config: Configuration options (uses defaults if None)
+    
+    Returns:
+        Tuple of (format_result, accessibility_result)
+        accessibility_result will be None if accessibility testing is disabled
+    """
+    if config is None:
+        config = URLValidationConfig()
+    
+    # Step 1: Format validation (always enabled)
+    format_result = validate_url_format(url) if config.enable_format_validation else None
+    
+    # Step 2: Accessibility testing (optional)
+    accessibility_result = None
+    if config.enable_accessibility_testing and format_result and format_result.is_valid:
+        test_url = format_result.normalized_url or format_result.url
+        accessibility_result = test_url_accessibility(test_url, config.accessibility_timeout)
+    
+    return format_result, accessibility_result
+
+
+# ============================================================================= 
+# DOCUMENT RELATIONSHIP MANAGEMENT - Step 3.3
+# =============================================================================
+
+from docx.opc.constants import RELATIONSHIP_TYPE
+import uuid
+
+def add_hyperlink_relationship(document: Document, url: str) -> str:
+    """
+    Add a hyperlink relationship to the document and return the relationship ID.
+    
+    This function properly manages Word document relationships for external URLs,
+    which is required for hyperlinks to function correctly in Word documents.
+    
+    Args:
+        document: Document object to add relationship to
+        url: External URL to create relationship for
+    
+    Returns:
+        str: Relationship ID (e.g., "rId123") that can be used in hyperlink elements
+    
+    Raises:
+        Exception: If relationship creation fails
     """
     try:
-        # Create hyperlink element
-        hyperlink = OxmlElement('w:hyperlink')
-        hyperlink.set(qn('r:id'), '')  # External link
-        hyperlink.set(qn('w:anchor'), url)
+        # Access the document part
+        document_part = document.part
         
-        # Create run within hyperlink
+        # Create the relationship for external hyperlink
+        # RELATIONSHIP_TYPE.HYPERLINK is the correct type for external URLs
+        relationship = document_part.relate_to(
+            url, 
+            RELATIONSHIP_TYPE.HYPERLINK,
+            is_external=True
+        )
+        
+        # The relate_to method might return different types depending on python-docx version
+        # Handle both cases: relationship object or direct rId string
+        if hasattr(relationship, 'rId'):
+            return relationship.rId
+        elif isinstance(relationship, str):
+            return relationship
+        else:
+            # Fallback: try to get the rId from the document's relationships
+            # Find the most recently added relationship
+            for rel_id, rel in document_part.rels.items():
+                if rel.target_ref == url and rel.reltype == RELATIONSHIP_TYPE.HYPERLINK:
+                    return rel_id
+            
+            raise Exception("Could not determine relationship ID")
+        
+    except Exception as e:
+        raise Exception(f"Failed to create hyperlink relationship for '{url}': {str(e)}")
+
+
+def get_document_relationships(document: Document) -> Dict[str, str]:
+    """
+    Get all hyperlink relationships from a document.
+    
+    Useful for debugging and understanding existing relationships.
+    
+    Args:
+        document: Document to examine
+    
+    Returns:
+        Dictionary mapping relationship IDs to target URLs
+    """
+    try:
+        relationships = {}
+        document_part = document.part
+        
+        for rel_id, relationship in document_part.rels.items():
+            if relationship.reltype == RELATIONSHIP_TYPE.HYPERLINK:
+                relationships[rel_id] = relationship.target_ref
+        
+        return relationships
+        
+    except Exception as e:
+        logging.warning(f"Failed to get document relationships: {e}")
+        return {}
+
+
+def cleanup_unused_hyperlink_relationships(document: Document, used_rel_ids: set) -> int:
+    """
+    Remove unused hyperlink relationships from document to keep it clean.
+    
+    Args:
+        document: Document to clean up
+        used_rel_ids: Set of relationship IDs that are currently in use
+    
+    Returns:
+        int: Number of relationships removed
+    """
+    try:
+        removed_count = 0
+        document_part = document.part
+        
+        # Get all hyperlink relationships
+        hyperlink_rels = {}
+        for rel_id, relationship in document_part.rels.items():
+            if relationship.reltype == RELATIONSHIP_TYPE.HYPERLINK:
+                hyperlink_rels[rel_id] = relationship
+        
+        # Remove unused relationships
+        for rel_id, relationship in hyperlink_rels.items():
+            if rel_id not in used_rel_ids:
+                del document_part.rels[rel_id]
+                removed_count += 1
+        
+        return removed_count
+        
+    except Exception as e:
+        logging.warning(f"Failed to cleanup unused relationships: {e}")
+        return 0
+
+
+def validate_relationship_id(document: Document, rel_id: str) -> bool:
+    """
+    Validate that a relationship ID exists in the document.
+    
+    Args:
+        document: Document to check
+        rel_id: Relationship ID to validate
+    
+    Returns:
+        bool: True if relationship exists, False otherwise
+    """
+    try:
+        document_part = document.part
+        return rel_id in document_part.rels
+    except Exception:
+        return False
+
+
+# ============================================================================= 
+# ENHANCED HYPERLINK CREATION - Step 3.4
+# =============================================================================
+
+def create_hyperlink_run_enhanced(para: Paragraph, text: str, url: str, 
+                                 validate_url: bool = True, 
+                                 config: URLValidationConfig = None,
+                                 document: Document = None) -> Run:
+    """
+    Create a proper hyperlink run in the paragraph using correct Word relationships.
+    
+    This is the FIXED version that replaces the broken create_hyperlink_run() function.
+    It uses proper Word document relationships instead of the incorrect w:anchor approach.
+    
+    Args:
+        para: Paragraph to add hyperlink to
+        text: Display text for the hyperlink
+        url: Target URL for the hyperlink
+        validate_url: Whether to validate URL format before creating hyperlink
+        config: Optional configuration for validation behavior
+        document: Document object (required for relationship creation)
+    
+    Returns:
+        Run: The created hyperlink run
+    
+    Raises:
+        Exception: If hyperlink creation fails
+    """
+    try:
+        # Step 1: Validate URL format if requested
+        if validate_url:
+            if config is None:
+                config = URLValidationConfig()
+            
+            format_result = validate_url_format(url)
+            if not format_result.is_valid:
+                raise Exception(f"Invalid URL format: {format_result.error_message}")
+            
+            # Use normalized URL if available (auto-fixed)
+            final_url = format_result.normalized_url or format_result.url
+        else:
+            final_url = url
+        
+        # Step 2: Get document object
+        if document is None:
+            raise Exception("Document parameter is required for hyperlink creation")
+        
+        doc = document
+        
+        # Step 3: Create document relationship
+        rel_id = add_hyperlink_relationship(doc, final_url)
+        
+        # Step 4: Create hyperlink XML element with proper relationship reference
+        hyperlink = OxmlElement('w:hyperlink')
+        hyperlink.set(qn('r:id'), rel_id)  # Use relationship ID, not anchor!
+        
+        # Step 5: Create run within hyperlink
         run_element = OxmlElement('w:r')
         run_props = OxmlElement('w:rPr')
         
-        # Add hyperlink styling
+        # Add hyperlink styling (blue color, underline)
         color = OxmlElement('w:color')
         color.set(qn('w:val'), '0000FF')
         run_props.append(color)
@@ -578,63 +1585,53 @@ def create_hyperlink_run(para: Paragraph, text: str, url: str) -> Run:
         
         run_element.append(run_props)
         
-        # Add text
+        # Add text content
         text_element = OxmlElement('w:t')
         text_element.text = text
         run_element.append(text_element)
         
         hyperlink.append(run_element)
         
-        # Insert into paragraph
+        # Step 6: Insert hyperlink into paragraph
         para._p.append(hyperlink)
         
-        # Return the run object
+        # Step 7: Return Run object
         return Run(run_element, para)
         
     except Exception as e:
         # Fallback to styled text if hyperlink creation fails
-        run = para.add_run(text)
-        run.font.color.rgb = RGBColor(0, 0, 255)
-        run.underline = True
-        return run
+        logging.warning(f"Hyperlink creation failed for '{url}': {e}. Falling back to styled text.")
+        return _create_styled_text_fallback(para, text)
 
-def find_runs_to_remove(para: Paragraph, target_string: str) -> List[Run]:
-    """Find runs that should be removed (gray shaded, hyperlinks, or target text)."""
-    runs_to_remove = []
+
+def _create_styled_text_fallback(para: Paragraph, text: str) -> Run:
+    """
+    Create styled text as fallback when hyperlink creation fails.
     
-    target_start, target_end = find_target_text_range(para, target_string)
+    This maintains visual consistency (blue, underlined text) even when
+    the actual hyperlink functionality cannot be created.
+    """
+    run = para.add_run(text)
+    run.font.color.rgb = RGBColor(0, 0, 255)  # Blue color
+    run.underline = True
+    return run
+
+
+# Backwards compatibility wrapper - redirects to new enhanced function
+def create_hyperlink_run(para: Paragraph, text: str, url: str) -> Run:
+    """
+    Legacy function that now uses the enhanced hyperlink creation.
     
-    if target_start == -1:
-        return runs_to_remove
-    
-    # Map character positions to runs
-    char_pos = 0
-    run_ranges = []
-    
-    for run in para.runs:
-        run_start = char_pos
-        run_end = char_pos + len(run.text)
-        run_ranges.append((run, run_start, run_end))
-        char_pos = run_end
-    
-    # Find runs to remove
-    for run, run_start, run_end in run_ranges:
-        should_remove = False
-        
-        # Check if run overlaps with target range
-        if run_start < target_end and run_end > target_start:
-            should_remove = True
-        # Check if it's gray shaded
-        elif is_run_gray_shaded(run):
-            should_remove = True
-        # Check if it's a hyperlink
-        elif is_run_hyperlink(run):
-            should_remove = True
-        
-        if should_remove:
-            runs_to_remove.append(run)
-    
-    return runs_to_remove
+    This maintains backwards compatibility while using the fixed implementation.
+    Note: This version will fall back to styled text since it can't access the document.
+    """
+    # Since we can't get the document from just a paragraph in the legacy interface,
+    # we'll fall back to styled text for backwards compatibility
+    logging.warning(f"Legacy hyperlink function used for '{url}'. Falling back to styled text. Use create_hyperlink_run_enhanced() with document parameter for proper hyperlinks.")
+    return _create_styled_text_fallback(para, text)
+
+
+# Duplicate function removed - using enhanced version at line 905
 
 
 def build_replacement_text_by_country(components: List[Dict]) -> str:
@@ -677,179 +1674,258 @@ def build_replacement_text_by_country(components: List[Dict]) -> str:
     # Join country blocks with double line breaks
     return '\n\n'.join(country_blocks)
 
-def get_replacement_components(mapping_row: pd.Series, section_type: str, 
-                              cached_components: Optional[List] = None, 
+def get_replacement_components(mapping_row: pd.Series, section_type: str,
+                              cached_components: Optional[List] = None,
                               country_delimiter: str = ";") -> List:
-    """Build replacement text components from mapping data."""
+    """Build replacement text components from mapping data.
+
+    Now supports multi-country block separation by grouping components by country.
+    Each country gets its own complete block that will be separated by double line breaks.
+    """
     if cached_components is not None:
         return cached_components
-    
+
     components = []
-    
+
     # Get line columns for this section type
-    line_columns = [col for col in mapping_row.index 
+    line_columns = [col for col in mapping_row.index
                    if col.startswith('Line ') and section_type in col]
-    
+
     if not line_columns:
         return components
-    
+
     # Get hyperlinks and email links
     hyperlinks_col = f'Hyperlinks {section_type}'
     email_col = f'Link for email - {section_type}'
-    
+
     hyperlinks_str = str(mapping_row.get(hyperlinks_col, '')).strip()
     email_str = str(mapping_row.get(email_col, '')).strip()
-    
+
     # Parse hyperlinks and emails (semicolon separated)
-    hyperlinks = [h.strip() for h in hyperlinks_str.split(country_delimiter) 
+    hyperlinks = [h.strip() for h in hyperlinks_str.split(country_delimiter)
                  if h.strip() and h.strip().lower() != 'nan']
-    emails = [e.strip() for e in email_str.split(country_delimiter) 
+    emails = [e.strip() for e in email_str.split(country_delimiter)
              if e.strip() and e.strip().lower() != 'nan']
-    
+
     # Sort line columns by number
     def extract_line_number(col_name):
         match = re.search(r'Line (\d+)', col_name)
         return int(match.group(1)) if match else 999
-    
+
     sorted_columns = sorted(line_columns, key=extract_line_number)
-    
+
     # Find Line 1 to get countries
     line_1_col = None
     for col in sorted_columns:
         if extract_line_number(col) == 1:
             line_1_col = col
             break
-    
+
     if not line_1_col:
         return components
-    
+
     line_1_text = str(mapping_row.get(line_1_col, '')).strip()
     if not line_1_text or line_1_text.lower() == 'nan':
         return components
-    
-    # Parse countries using semicolon delimiter
-    countries = [c.strip() for c in line_1_text.split(country_delimiter) if c.strip()]
-    
+
+    # Get countries from dedicated bold country column
+    bold_countries_col = f'Line 1 - Country names to be bolded - {section_type}'
+    bold_countries_str = str(mapping_row.get(bold_countries_col, '')).strip()
+
+    # Parse countries using comma/semicolon delimiter
+    if bold_countries_str and bold_countries_str.lower() != 'nan':
+        # Try comma first (as seen in mapping file), then semicolon as fallback
+        if ',' in bold_countries_str:
+            countries = [c.strip() for c in bold_countries_str.split(',') if c.strip()]
+        else:
+            countries = [c.strip() for c in bold_countries_str.split(country_delimiter) if c.strip()]
+    else:
+        # Fallback: extract from line text (backwards compatibility)
+        countries = [c.strip() for c in line_1_text.split(country_delimiter) if c.strip()]
+
     if not countries:
         return components
-    
+
     # Process each line
     for col in sorted_columns:
         line_num = extract_line_number(col)
         content = str(mapping_row.get(col, '')).strip()
-        
+
         if not content or content.lower() == 'nan':
             continue
-        
+
         # Split content by countries using semicolon delimiter
         parts = [p.strip() for p in content.split(country_delimiter)]
-        
+
         for i, country in enumerate(countries):
             if i < len(parts) and parts[i]:
                 text = parts[i]
-                
+
                 # Determine links for this country position
                 hyperlink = hyperlinks[i] if i < len(hyperlinks) else None
                 email = emails[i] if i < len(emails) else None
-                
+
                 components.append({
                     'line': line_num,
                     'country': country,
+                    'country_index': i,  # NEW: Add country index for grouping
                     'text': text,
                     'hyperlink': hyperlink,
                     'email': email
                 })
-    
+
     return components
 
 
 def insert_formatted_replacement_surgically(para: Paragraph, insertion_point: int, 
-                                          components: List[Dict], country_delimiter: str = ";"):
+                                          components: List[Dict], country_delimiter: str = ";",
+                                          document: Document = None):
     """
     Insert properly formatted replacement text at a specific position in the paragraph.
+
+    NEW: Now supports multi-country block separation. Each country gets its own
+    complete block separated by double line breaks (\\n\\n).
     """
-    # Group components by line
-    lines = {}
+    # Group components by country first, then by line within each country
+    countries = {}
     for comp in components:
+        # Use a tuple of (country, index) as the key to group
+        # This handles the (rare) case of the same country appearing twice
+        country_key = (comp['country'], comp.get('country_index', 0))
         line_num = comp['line']
-        if line_num not in lines:
-            lines[line_num] = []
-        lines[line_num].append(comp)
-    
+
+        if country_key not in countries:
+            countries[country_key] = {'country': comp['country'], 'lines': {}}
+
+        if line_num not in countries[country_key]['lines']:
+            countries[country_key]['lines'][line_num] = []
+        countries[country_key]['lines'][line_num].append(comp)
+
+    # Sort countries based on their index
+    sorted_country_keys = sorted(countries.keys(), key=lambda x: x[1])
+
     # Insert at the specified position
     current_element = None
     if insertion_point < len(para.runs):
         current_element = para.runs[insertion_point]._element
-    
-    # Build replacement text line by line
-    for line_idx, line_num in enumerate(sorted(lines.keys())):
-        line_components = lines[line_num]
+
+    first_break_run = para.add_run('\n')
+    if current_element is not None:
+        current_element.addnext(first_break_run._element)
+        current_element = first_break_run._element
+    else:
+        # This handles the case where the paragraph was empty
+        current_element = first_break_run._element
         
-        # Add line break before non-first lines
-        if line_idx > 0:
-            new_run = para.add_run('\n')
+    # Build replacement text country by country
+    for country_idx, country_key in enumerate(sorted_country_keys):
+        country_info = countries[country_key]
+        lines = country_info['lines']
+
+        # Add double line break before non-first countries (multi-country separation)
+        if country_idx > 0:
+            double_break_run = para.add_run('\n\n')
             if current_element is not None:
-                current_element.addnext(new_run._element)
-                current_element = new_run._element
-        
-        # Add components for this line
-        for comp_idx, comp in enumerate(line_components):
-            # Add delimiter between components (except first)
-            if comp_idx > 0:
-                delimiter_run = para.add_run(f'{country_delimiter} ')
+                current_element.addnext(double_break_run._element)
+                current_element = double_break_run._element
+
+        # Build lines within this country
+        for line_idx, line_num in enumerate(sorted(lines.keys())):
+            line_components = lines[line_num]
+
+            # Add single line break before non-first lines within same country
+            if line_idx > 0:
+                line_break_run = para.add_run('\n')
                 if current_element is not None:
-                    current_element.addnext(delimiter_run._element)
-                    current_element = delimiter_run._element
-            
-            text = comp['text']
-            country = comp['country']
-            hyperlink = comp.get('hyperlink')
-            email = comp.get('email')
-            
-            # Add text with country bolding
-            if country and country in text:
-                # Split text to bold only the country name
-                parts = text.split(country, 1)
+                    current_element.addnext(line_break_run._element)
+                    current_element = line_break_run._element
+
+            # Process all components for this line
+            for comp_idx, comp in enumerate(line_components):
+                text = comp['text']
+                country = comp['country']
+                hyperlink = comp.get('hyperlink')
+                email = comp.get('email')
+
+                # Normalize for comparison
+                text_clean = text.replace("e-mail:", "").replace("Website:", "").strip()
                 
-                # Add text before country
-                if parts[0]:
-                    text_run = para.add_run(parts[0])
-                    if current_element is not None:
-                        current_element.addnext(text_run._element)
-                        current_element = text_run._element
+                # Check if this component's text is supposed to be an email link
+                is_email_link = email and (email in text_clean or text_clean in email)
                 
-                # Add bolded country name
-                country_run = para.add_run(country)
-                country_run.bold = True
-                if current_element is not None:
-                    current_element.addnext(country_run._element)
-                    current_element = country_run._element
-                
-                # Add text after country
-                if len(parts) > 1 and parts[1]:
-                    remaining_run = para.add_run(parts[1])
-                    if current_element is not None:
-                        current_element.addnext(remaining_run._element)
-                        current_element = remaining_run._element
-            else:
-                text_run = para.add_run(text)
-                if current_element is not None:
-                    current_element.addnext(text_run._element)
-                    current_element = text_run._element
-            
-            # Add hyperlink if present
-            if hyperlink:
-                hyperlink_run = create_hyperlink_run(para, f' {hyperlink}', hyperlink)
-                if current_element is not None:
-                    current_element.addnext(hyperlink_run._element)
-                    current_element = hyperlink_run._element
-            
-            # Add email link if present
-            if email:
-                email_run = create_hyperlink_run(para, f' {email}', f'mailto:{email}')
-                if current_element is not None:
-                    current_element.addnext(email_run._element)
-                    current_element = email_run._element
+                # Check if this component's text is supposed to be a web link
+                # (and not an email link, which takes precedence)
+                is_hyperlink = not is_email_link and hyperlink and (
+                    hyperlink in text_clean or text_clean in hyperlink
+                )
+
+                # --- 1. RENDER AS EMAIL LINK ---
+                if is_email_link:
+                    try:
+                        email_url = f'mailto:{email}' if not email.startswith('mailto:') else email
+                        email_run = create_hyperlink_run_enhanced(
+                            para, text, email_url,  # Use original 'text' as display
+                            validate_url=True, document=document
+                        )
+                        if current_element is not None:
+                            current_element.addnext(email_run._element)
+                            current_element = email_run._element
+                    except Exception as e:
+                        logging.warning(f"Failed to create email link for '{email}': {e}")
+                        fallback_run = _create_styled_text_fallback(para, text)
+                        if current_element is not None:
+                            current_element.addnext(fallback_run._element)
+                            current_element = fallback_run._element
+
+                # --- 2. RENDER AS HYPERLINK ---
+                elif is_hyperlink:
+                    try:
+                        hyperlink_run = create_hyperlink_run_enhanced(
+                            para, text, hyperlink,  # Use original 'text' as display
+                            validate_url=True, document=document
+                        )
+                        if current_element is not None:
+                            current_element.addnext(hyperlink_run._element)
+                            current_element = hyperlink_run._element
+                    except Exception as e:
+                        logging.warning(f"Failed to create hyperlink for '{hyperlink}': {e}")
+                        fallback_run = _create_styled_text_fallback(para, text)
+                        if current_element is not None:
+                            current_element.addnext(fallback_run._element)
+                            current_element = fallback_run._element
+
+                # --- 3. RENDER AS PLAIN TEXT (with potential bolding) ---
+                else:
+                    if country and country in text:
+                        # Split text to bold only the country name
+                        parts = text.split(country, 1)
+                        
+                        # Add text before country
+                        if parts[0]:
+                            text_run = para.add_run(parts[0])
+                            if current_element is not None:
+                                current_element.addnext(text_run._element)
+                                current_element = text_run._element
+                        
+                        # Add bolded country name
+                        country_run = para.add_run(country)
+                        country_run.bold = True
+                        if current_element is not None:
+                            current_element.addnext(country_run._element)
+                            current_element = country_run._element
+                        
+                        # Add text after country
+                        if len(parts) > 1 and parts[1]:
+                            remaining_run = para.add_run(parts[1])
+                            if current_element is not None:
+                                current_element.addnext(remaining_run._element)
+                                current_element = remaining_run._element
+                    else:
+                        text_run = para.add_run(text)
+                        if current_element is not None:
+                            current_element.addnext(text_run._element)
+                            current_element = text_run._element
+
 
 
 def debug_paragraph_structure(para: Paragraph, target_string: str):
@@ -1063,9 +2139,23 @@ def build_replacement_components_simple(mapping_row: pd.Series, section_type: st
         print("Line 1 text is empty")
         return components
     
-    # Parse countries using semicolon delimiter
-    countries = [c.strip() for c in line_1_text.split(country_delimiter) if c.strip()]
-    print(f"Countries: {countries}")
+    # Get countries from dedicated bold country column
+    bold_countries_col = f'Line 1 - Country names to be bolded - {section_type}'
+    bold_countries_str = str(mapping_row.get(bold_countries_col, '')).strip()
+    print(f"Bold countries column: '{bold_countries_col}' = '{bold_countries_str}'")
+    
+    # Parse countries using comma/semicolon delimiter
+    if bold_countries_str and bold_countries_str.lower() != 'nan':
+        # Try comma first (as seen in mapping file), then semicolon as fallback
+        if ',' in bold_countries_str:
+            countries = [c.strip() for c in bold_countries_str.split(',') if c.strip()]
+        else:
+            countries = [c.strip() for c in bold_countries_str.split(country_delimiter) if c.strip()]
+        print(f"Countries from bold column: {countries}")
+    else:
+        # Fallback: extract from line text (backwards compatibility)
+        countries = [c.strip() for c in line_1_text.split(country_delimiter) if c.strip()]
+        print(f"Countries from fallback (line text): {countries}")
     
     if not countries:
         print("No countries found")
@@ -1194,28 +2284,51 @@ def run_annex_update_v2(doc: Document, mapping_row: pd.Series, section_type: str
     for para in doc.paragraphs:
         if target_string.lower() in para.text.lower():
             
-            # Find runs to remove
+            # Find runs to remove - only gray shaded target text
             runs_to_remove = find_runs_to_remove(para, target_string)
-            
+
             if runs_to_remove:
-                # Remove the identified runs
+                # Remove only the identified runs (conservative approach)
+                print(f"Removing {len(runs_to_remove)} specific runs...")
                 for run in runs_to_remove:
-                    run._element.getparent().remove(run._element)
-                
-                # Build and insert replacement text
-                replacement_text = build_replacement_text_by_country(components)
-                
+                    try:
+                        run._element.getparent().remove(run._element)
+                        print(f"  Removed: '{run.text[:30]}...'")
+                    except Exception as e:
+                        print(f"  Error removing run: {e}")
+
+                # Check remaining text
+                remaining_text = para.text.strip()
+                print(f"Text after removal: '{remaining_text}'")
+            else:
+                print(f"No runs to remove - proceeding with insertion")
+
+            # Insert formatted replacement at the end of the paragraph (ALWAYS after removal)
+            try:
+                insertion_point = len(para.runs)
+
+                insert_formatted_replacement_surgically(
+                    para, insertion_point, components,
+                    country_delimiter=country_delimiter, document=doc
+                )
+
+                # Insertion successful
+
                 # For PL sections, append additional text
                 if section_type == "PL":
                     additional_text = str(mapping_row.get('Text to be appended after National reporting system PL', '')).strip()
                     if additional_text and additional_text.lower() != 'nan':
-                        replacement_text += f"\n\n{additional_text}"
-                
-                # Insert the replacement
-                para.add_run(replacement_text)
-                
-                found = True
-                break
+                        para.add_run(f"\n\n{additional_text}")
+
+            except Exception as e:
+                print(f"Error during insertion: {e}")
+                import traceback
+                traceback.print_exc()
+                # Return False but still return components (not the error message)
+                return False, components
+
+            found = True
+            break
     
     return found, components
 
@@ -1364,20 +2477,45 @@ def update_annex_iiib_date(doc: Document, mapping_row: pd.Series) -> bool:
     
     return found
 
-def update_local_representatives(doc: Document, mapping_row: pd.Series) -> bool:
-    """Update local representatives in Section 6 of Annex IIIB."""
-    local_rep_text = str(mapping_row.get('Local Representative', '')).strip()
-    bold_countries_str = str(mapping_row.get('Country names to be bolded - Local Reps', '')).strip()
+def filter_local_representatives(doc: Document, mapping_row: pd.Series) -> bool:
+    """
+    Filter local representatives in Section 6 of Annex IIIB to keep only applicable ones.
     
-    if not local_rep_text or local_rep_text.lower() == 'nan':
+    This function implements the manual process requirement to "Keep only applicable 
+    local rep(s) for each language file" as specified in Section 6 of the manual process.
+    
+    The function identifies the local representative section and removes all local reps
+    except those applicable to the current country/language, then applies bold formatting
+    to country names as specified.
+    
+    Args:
+        doc: Document object to modify
+        mapping_row: Row from mapping file containing local rep filtering data
+    
+    Returns:
+        bool: True if local representatives were successfully filtered
+    """
+    # Get applicable local representatives for this language/country
+    applicable_reps = str(mapping_row.get('Local Representative', '')).strip()
+    country = str(mapping_row.get('Country', '')).strip()
+    language = str(mapping_row.get('Language', '')).strip()
+    
+    if not applicable_reps or applicable_reps.lower() == 'nan':
         return False
     
+    # Parse countries that should be bold formatted
+    bold_countries_str = str(mapping_row.get('Country names to be bolded - Local Reps', '')).strip()
     bold_countries = [c.strip() for c in bold_countries_str.split(',') 
                      if c.strip() and c.strip().lower() != 'nan']
     
     found = False
     in_section_6 = False
+    in_local_rep_section = False
+    local_rep_start_idx = None
+    paragraphs_to_remove = []
+    local_rep_header_para = None
     
+    # Phase 1: Identify Section 6 and locate local representative paragraphs
     for idx, para in enumerate(doc.paragraphs):
         text_lower = para.text.lower()
         
@@ -1388,34 +2526,124 @@ def update_local_representatives(doc: Document, mapping_row: pd.Series) -> bool:
             in_section_6 = True
             continue
         
-        # Look for existing local rep text to replace
-        if in_section_6 and ('marketing authorisation holder' in text_lower or
-                            'local representative' in text_lower or
-                            'représentant local' in text_lower):
-            
-            para.clear()
-            
-            # Process the local rep text line by line
-            lines = local_rep_text.split('\n')
-            
-            for i, line in enumerate(lines):
-                if not line.strip():
-                    para.add_run('\n')
-                    continue
-                
-                # Check if this line contains a country to be bolded
-                should_bold = any(country in line for country in bold_countries)
-                
-                run = para.add_run(line)
-                run.bold = should_bold
-                
-                if i < len(lines) - 1:
-                    para.add_run('\n')
-            
-            found = True
+        # Check if we've left Section 6 (entering next section)
+        if in_section_6 and _is_section_header(para.text):
             break
+            
+        # Look for local representative section header
+        if in_section_6 and ('local representative' in text_lower or 'représentant local' in text_lower):
+            in_local_rep_section = True
+            local_rep_header_para = para
+            local_rep_start_idx = idx
+            continue
+            
+        # Collect local rep entries to potentially remove
+        if in_local_rep_section:
+            # Stop if we hit marketing auth holder or other major section
+            if ('marketing authorisation holder' in text_lower or 
+                'manufacturing authorisation holder' in text_lower or
+                'this leaflet was last revised' in text_lower or
+                _is_section_header(para.text)):
+                break
+                
+            # Check if this paragraph contains a local rep entry
+            if _contains_country_local_rep_entry(para.text):
+                # Determine if this local rep should be kept or removed
+                if not _should_keep_local_rep_entry(para.text, country, applicable_reps):
+                    paragraphs_to_remove.append(idx)
+                else:
+                    # This is the applicable local rep - apply bold formatting
+                    _apply_bold_formatting_to_paragraph(para, bold_countries)
+                    found = True
     
+    # Phase 2: Remove non-applicable local representative paragraphs
+    # Remove in reverse order to maintain correct indices
+    for idx in reversed(paragraphs_to_remove):
+        # Get the paragraph to remove
+        para_to_remove = doc.paragraphs[idx]
+        # Remove the paragraph's content
+        para_to_remove.clear()
+        
     return found
+
+
+def _contains_country_local_rep_entry(text: str) -> bool:
+    """
+    Check if paragraph contains a country-specific local representative entry.
+    These typically start with a country name followed by a colon.
+    """
+    text_stripped = text.strip()
+    if not text_stripped:
+        return False
+        
+    # Look for patterns like "Germany:", "France:", "Ireland:", etc.
+    import re
+    # Match country name at start of line followed by colon
+    return bool(re.match(r'^[A-Za-z\s]+:', text_stripped))
+
+
+def _should_keep_local_rep_entry(para_text: str, target_country: str, applicable_reps: str) -> bool:
+    """
+    Determine if a local representative entry should be kept based on the target country.
+    """
+    # Check if the paragraph contains the target country
+    return target_country.lower() in para_text.lower()
+
+
+def _apply_bold_formatting_to_paragraph(para: Paragraph, bold_countries: list) -> None:
+    """
+    Apply bold formatting to country names within an existing paragraph.
+    """
+    if not bold_countries:
+        return
+        
+    # Get the current text
+    current_text = para.text
+    
+    # Clear and rebuild the paragraph with proper formatting
+    para.clear()
+    
+    remaining_text = current_text
+    for country in bold_countries:
+        if country.lower() in remaining_text.lower():
+            # Find the country name (case-insensitive)
+            import re
+            match = re.search(re.escape(country), remaining_text, re.IGNORECASE)
+            if match:
+                # Add text before country name
+                before_text = remaining_text[:match.start()]
+                if before_text:
+                    para.add_run(before_text)
+                
+                # Add country name with bold formatting
+                bold_run = para.add_run(match.group())
+                bold_run.bold = True
+                
+                # Continue with remaining text
+                remaining_text = remaining_text[match.end():]
+    
+    # Add any remaining text
+    if remaining_text:
+        para.add_run(remaining_text)
+
+
+def _is_section_header(text: str) -> bool:
+    """Check if text appears to be a section header (like "7.", "8.", etc.)"""
+    text_lower = text.strip().lower()
+    # Look for patterns like "7.", "section 7", etc.
+    import re
+    return bool(re.match(r'^\s*\d+\.', text) or re.match(r'^\s*section\s+\d+', text_lower))
+
+
+
+
+# Legacy function for backwards compatibility - now calls the new filtering function
+def update_local_representatives(doc: Document, mapping_row: pd.Series) -> bool:
+    """
+    Legacy function for backwards compatibility.
+    Now calls the new filter_local_representatives function.
+    """
+    return filter_local_representatives(doc, mapping_row)
 
 # ============================================================================= 
 # Split Annexes Workflow
