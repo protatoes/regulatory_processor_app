@@ -5,19 +5,30 @@ import os
 import shutil
 from pathlib import Path
 from typing import List, Optional, Tuple
-import pandas as pd
 from docx import Document
 from docx.document import Document as DocumentObject
 
 try:
     from .config import ProcessingConfig, ProcessingResult, ProcessingStats, DirectoryNames, FileMarkers, ValidationError, ProcessingError, DocumentError, MappingError
-    from .file_manager import load_mapping_table, identify_document_country_and_language, find_mapping_rows_for_language, generate_output_filename, convert_to_pdf
+    from .file_manager import (
+        load_mapping_table,
+        identify_document_country_and_language,
+        generate_output_filename,
+        convert_to_pdf,
+    )
+    from .mapping_table import MappingRow, MappingTable
     from .document_utils import update_section_10_date, update_annex_iiib_date, update_local_representatives
     from .document_splitter import split_annexes
 except ImportError:
     # Fallback for when module is imported directly
     from config import ProcessingConfig, ProcessingResult, ProcessingStats, DirectoryNames, FileMarkers, ValidationError, ProcessingError, DocumentError, MappingError
-    from file_manager import load_mapping_table, identify_document_country_and_language, find_mapping_rows_for_language, generate_output_filename, convert_to_pdf
+    from file_manager import (
+        load_mapping_table,
+        identify_document_country_and_language,
+        generate_output_filename,
+        convert_to_pdf,
+    )
+    from mapping_table import MappingRow, MappingTable
     from document_utils import update_section_10_date, update_annex_iiib_date, update_local_representatives
     from document_splitter import split_annexes
 
@@ -90,7 +101,7 @@ class DocumentUpdater:
         self.config = config
         self.logger = logging.getLogger(f"{__name__}.DocumentUpdater")
     
-    def apply_all_updates(self, doc: DocumentObject, mapping_row: pd.Series) -> Tuple[bool, List[str]]:
+    def apply_all_updates(self, doc: DocumentObject, mapping_row: MappingRow) -> Tuple[bool, List[str]]:
         """Apply all required updates to a document."""
         updates_applied = []
         total_success = False
@@ -130,7 +141,7 @@ class DocumentUpdater:
         except Exception as e:
             raise DocumentError(f"Failed to apply document updates: {e}")
     
-    def _update_document_with_fixed_smpc_blocks(self, doc: Document, mapping_row: pd.Series) -> Tuple[bool, List[str]]:
+    def _update_document_with_fixed_smpc_blocks(self, doc: Document, mapping_row: MappingRow) -> Tuple[bool, List[str]]:
         """
         Update SmPC Section 4.8 with multi-country formatted text blocks.
 
@@ -176,7 +187,7 @@ class DocumentUpdater:
 
         return success, updates
 
-    def _build_smpc_country_blocks(self, mapping_row: pd.Series) -> List[Dict]:
+    def _build_smpc_country_blocks(self, mapping_row: MappingRow) -> List[Dict]:
         """
         Build formatted country blocks from mapping data.
 
@@ -283,7 +294,7 @@ class DocumentUpdater:
 
         return section_paragraphs
 
-    def _update_document_with_fixed_pl_blocks(self, doc: Document, mapping_row: pd.Series) -> Tuple[bool, List[str]]:
+    def _update_document_with_fixed_pl_blocks(self, doc: Document, mapping_row: MappingRow) -> Tuple[bool, List[str]]:
         """
         Update PL Section 4 with multi-country formatted text blocks.
 
@@ -337,7 +348,7 @@ class DocumentUpdater:
 
         return success, updates
 
-    def _build_pl_country_blocks(self, mapping_row: pd.Series) -> List[Dict]:
+    def _build_pl_country_blocks(self, mapping_row: MappingRow) -> List[Dict]:
         """
         Build PL country blocks by reusing SmPC logic and appending PL-specific text.
         """
@@ -422,7 +433,7 @@ class DocumentProcessor:
             
             # Validate inputs
             folder = self._validate_folder_path(folder_path)
-            mapping_df = self._load_and_validate_mapping(mapping_path)
+            mapping_table = self._load_and_validate_mapping(mapping_path)
             
             # Setup processing environment
             file_manager = FileManager(folder, self.config)
@@ -443,7 +454,7 @@ class DocumentProcessor:
             for document_path in documents:
                 try:
                     result = self._process_single_document(
-                        document_path, mapping_df, file_manager, split_dir, pdf_dir
+                        document_path, mapping_table, file_manager, split_dir, pdf_dir
                     )
                     output_files.extend(result.output_files)
                     
@@ -469,15 +480,15 @@ class DocumentProcessor:
             raise ValidationError(f"Invalid directory: {folder_path}")
         return folder
     
-    def _load_and_validate_mapping(self, mapping_path: str) -> pd.DataFrame:
+    def _load_and_validate_mapping(self, mapping_path: str) -> MappingTable:
         """Load and validate mapping file."""
         try:
-            mapping_df = load_mapping_table(mapping_path)
-            if mapping_df is None or mapping_df.empty:
+            mapping_table = load_mapping_table(mapping_path, self.config)
+            if mapping_table is None or len(mapping_table) == 0:
                 raise MappingError(f"Could not load mapping file: {mapping_path}")
             
-            self.logger.info(f"Mapping loaded: {len(mapping_df)} configurations")
-            return mapping_df
+            self.logger.info(f"Mapping loaded: {len(mapping_table)} configurations")
+            return mapping_table
             
         except Exception as e:
             raise MappingError(f"Failed to load mapping file: {e}")
@@ -485,7 +496,7 @@ class DocumentProcessor:
     def _process_single_document(
         self,
         document_path: Path,
-        mapping_df: pd.DataFrame,
+        mapping_table: MappingTable,
         file_manager: FileManager,
         split_dir: Path,
         pdf_dir: Path
@@ -510,7 +521,7 @@ class DocumentProcessor:
             self.logger.info(f"Document identified - Language: {language_name}, Country: {country_name}")
             
             # Find mapping rows for this language
-            mapping_rows = find_mapping_rows_for_language(mapping_df, language_name)
+            mapping_rows = mapping_table.for_language(language_name)
             if not mapping_rows:
                 error_msg = f"No mapping found for language: {language_name}"
                 self.logger.error(error_msg)
@@ -519,14 +530,16 @@ class DocumentProcessor:
             self.logger.info(f"Found {len(mapping_rows)} variant(s) to process")
             
             # Create backup
-            file_manager.create_backup(document_path)
+            backup_path = file_manager.create_backup(document_path)
+            if backup_path:
+                self.stats.record_backup()
             
             # Process each variant
             output_files = []
             variant_success_count = 0
             
             for i, mapping_row in enumerate(mapping_rows, 1):
-                country = mapping_row['Country']
+                country = mapping_row.country_display or str(mapping_row.get('Country', '')).strip()
                 self.logger.info(f"🌍 Processing variant {i}/{len(mapping_rows)}: {country}")
                 
                 try:
@@ -536,17 +549,16 @@ class DocumentProcessor:
                     
                     if result.success:
                         variant_success_count += 1
-                        self.stats.variants_successful += 1
                         output_files.extend(result.output_files)
                         self.logger.info(f"✅ Variant {i} completed successfully")
                     else:
                         self.logger.warning(f"⚠️ Variant {i} completed with issues: {result.message}")
-                    
-                    self.stats.variants_processed += 1
-                    
+
+                    self.stats.record_variant(result.success)
+
                 except Exception as e:
                     self.logger.error(f"❌ Error processing variant {i} ({country}): {e}")
-                    self.stats.errors_encountered += 1
+                    self.stats.record_variant(False)
             
             # Document summary
             success_rate = (variant_success_count / len(mapping_rows)) * 100 if mapping_rows else 0
@@ -565,14 +577,14 @@ class DocumentProcessor:
     def _process_document_variant(
         self,
         document_path: Path,
-        mapping_row: pd.Series,
+        mapping_row: MappingRow,
         split_dir: Path,
         pdf_dir: Path
     ) -> ProcessingResult:
         """Process a single document variant."""
         
-        country = mapping_row['Country']
-        language = mapping_row['Language']
+        country = mapping_row.country_display or str(mapping_row.get('Country', '')).strip()
+        language = mapping_row.language or str(mapping_row.get('Language', '')).strip()
         
         try:
             # Load document
@@ -600,68 +612,79 @@ class DocumentProcessor:
         self,
         doc: Document,
         original_path: Path,
-        mapping_row: pd.Series,
+        mapping_row: MappingRow,
         split_dir: Path,
         pdf_dir: Path,
         updates_applied: List[str]
     ) -> ProcessingResult:
         """Save updated document and split into annexes."""
-        
-        country = mapping_row['Country']
-        language = mapping_row['Language']
-        output_files = []
-        
+
+        country = mapping_row.country_display or str(mapping_row.get('Country', '')).strip()
+        language = mapping_row.language or str(mapping_row.get('Language', '')).strip()
+        output_files: List[str] = []
+
         try:
             # Generate output filename
             base_name = original_path.stem
             output_filename = generate_output_filename(base_name, language, country, "combined")
             output_path = original_path.parent / output_filename
-            
+
             # Save updated document
             doc.save(str(output_path))
             output_files.append(str(output_path))
             self.logger.info(f"💾 Saved combined document: {output_filename}")
-            
+
             # Split into annexes
             self.logger.info("🔀 Splitting into separate annexes...")
             annex_i_path, annex_iiib_path = split_annexes(
                 str(output_path), str(split_dir), language, country, mapping_row
             )
-            
-            output_files.extend([annex_i_path, annex_iiib_path])
-            self.logger.info(f"✅ Split completed")
-            
+
+            if annex_i_path:
+                output_files.append(annex_i_path)
+                self.stats.annex_i_created += 1
+            if annex_iiib_path:
+                output_files.append(annex_iiib_path)
+                self.stats.annex_iiib_created += 1
+            self.logger.info("✅ Split completed")
+
             # Convert to PDF if enabled
             if self.config.convert_to_pdf:
                 try:
                     self.logger.info("📄 Converting to PDF...")
-                    
-                    # Convert Annex I
+
                     pdf_annex_i = convert_to_pdf(annex_i_path, str(pdf_dir))
                     if pdf_annex_i:
                         output_files.append(pdf_annex_i)
-                    
-                    # Convert Annex IIIB
+                        self.stats.record_pdf_result(True)
+                    else:
+                        self.stats.record_pdf_result(False)
+
                     pdf_annex_iiib = convert_to_pdf(annex_iiib_path, str(pdf_dir))
                     if pdf_annex_iiib:
                         output_files.append(pdf_annex_iiib)
-                        
+                        self.stats.record_pdf_result(True)
+                    else:
+                        self.stats.record_pdf_result(False)
+
                     self.logger.info("✅ PDF conversion completed")
-                    
-                except Exception as e:
-                    self.logger.warning(f"PDF conversion failed: {e}")
-            
-            self.stats.output_files_created += len(output_files)
-            
+
+                except Exception as exc:
+                    self.logger.warning(f"PDF conversion failed: {exc}")
+                    self.stats.record_pdf_result(False)
+
+            self.stats.record_outputs(len(output_files))
+
             return ProcessingResult(
                 success=True,
                 message=f"Successfully processed variant: {country}",
                 output_files=output_files
             )
-            
+
         except Exception as e:
             raise DocumentError(f"Failed to save and split document: {e}")
-    
+
+
     def _generate_final_result(self, output_files: List[str]) -> ProcessingResult:
         """Generate final processing result."""
         success_rate = self.stats.success_rate()
