@@ -21,6 +21,13 @@ from .file_manager import (
     find_mapping_rows_for_language, generate_output_filename, convert_to_pdf
 )
 
+from .mapping_table import (
+    MappingRow,
+    MappingTable,
+    REQUIRED_COLUMNS,
+    FILENAME_PATTERN_COLUMNS,
+)
+
 from .document_utils import (
     copy_paragraph, is_hex_gray_color, is_run_gray_shaded, is_run_hyperlink,
     find_target_text_runs, find_target_text_range, find_runs_to_remove,
@@ -53,6 +60,7 @@ __all__ = [
     'load_mapping_table', 'get_country_code_mapping', 
     'extract_country_code_from_filename', 'identify_document_country_and_language',
     'find_mapping_rows_for_language', 'generate_output_filename', 'convert_to_pdf',
+    'MappingRow', 'MappingTable', 'REQUIRED_COLUMNS', 'FILENAME_PATTERN_COLUMNS',
     
     # Document utilities
     'copy_paragraph', 'is_hex_gray_color', 'is_run_gray_shaded', 'is_run_hyperlink',
