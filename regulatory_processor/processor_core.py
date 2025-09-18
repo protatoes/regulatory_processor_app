@@ -9,10 +9,17 @@ import pandas as pd
 from docx import Document
 from docx.document import Document as DocumentObject
 
-from .config import ProcessingConfig, ProcessingResult, ProcessingStats, DirectoryNames, FileMarkers, ValidationError, ProcessingError, DocumentError, MappingError
-from .file_manager import load_mapping_table, identify_document_country_and_language, find_mapping_rows_for_language, generate_output_filename, convert_to_pdf
-from .document_utils import update_section_10_date, update_annex_iiib_date, update_local_representatives
-from .document_splitter import split_annexes
+try:
+    from .config import ProcessingConfig, ProcessingResult, ProcessingStats, DirectoryNames, FileMarkers, ValidationError, ProcessingError, DocumentError, MappingError
+    from .file_manager import load_mapping_table, identify_document_country_and_language, find_mapping_rows_for_language, generate_output_filename, convert_to_pdf
+    from .document_utils import update_section_10_date, update_annex_iiib_date, update_local_representatives
+    from .document_splitter import split_annexes
+except ImportError:
+    # Fallback for when module is imported directly
+    from config import ProcessingConfig, ProcessingResult, ProcessingStats, DirectoryNames, FileMarkers, ValidationError, ProcessingError, DocumentError, MappingError
+    from file_manager import load_mapping_table, identify_document_country_and_language, find_mapping_rows_for_language, generate_output_filename, convert_to_pdf
+    from document_utils import update_section_10_date, update_annex_iiib_date, update_local_representatives
+    from document_splitter import split_annexes
 
 
 class FileManager:
@@ -89,24 +96,30 @@ class DocumentUpdater:
         total_success = False
         
         try:
-            # 1. Update national reporting systems
+            # 1. Update national reporting systems - SmPC Section 4.8
             smpc_success, smpc_updates = self._update_document_with_fixed_smpc_blocks(doc, mapping_row)
             if smpc_success:
                 updates_applied.extend(smpc_updates)
                 total_success = True
-            
-            # 2. Update dates
+
+            # 2. Update national reporting systems - PL Section 4
+            pl_success, pl_updates = self._update_document_with_fixed_pl_blocks(doc, mapping_row)
+            if pl_success:
+                updates_applied.extend(pl_updates)
+                total_success = True
+
+            # 3. Update dates
             annex_i_date_success = update_section_10_date(doc, mapping_row)
             if annex_i_date_success:
                 updates_applied.append("Annex I dates")
                 total_success = True
-            
+
             annex_iiib_date_success = update_annex_iiib_date(doc, mapping_row)
             if annex_iiib_date_success:
                 updates_applied.append("Annex IIIB dates")
                 total_success = True
-            
-            # 3. Update local representatives
+
+            # 4. Update local representatives
             local_rep_success = update_local_representatives(doc, mapping_row)
             if local_rep_success:
                 updates_applied.append("Local representatives")
@@ -118,29 +131,263 @@ class DocumentUpdater:
             raise DocumentError(f"Failed to apply document updates: {e}")
     
     def _update_document_with_fixed_smpc_blocks(self, doc: Document, mapping_row: pd.Series) -> Tuple[bool, List[str]]:
-        """Update national reporting systems in the document."""
-        # This would contain the actual update logic from the original processor
-        # For now, returning a basic implementation
+        """
+        Update SmPC Section 4.8 with multi-country formatted text blocks.
+
+        Builds complete text blocks for each country using Lines 1-10, applies bold
+        formatting to country names, creates hyperlinks, and replaces original text.
+        """
         updates = []
         success = False
-        
+
         try:
-            # SmPC Section 4.8 updates
-            nrs_text = mapping_row.get('4.8 NRS Text', '')
-            if nrs_text and str(nrs_text).lower() != 'nan':
+            # Get original text to replace
+            original_text = mapping_row.get('Original text national reporting - SmPC', '')
+            if not original_text or str(original_text).lower() in ['nan', '']:
+                return False, updates
+
+            # Build country blocks from mapping data
+            country_blocks = self._build_smpc_country_blocks(mapping_row)
+            if not country_blocks:
+                return False, updates
+
+            # Find SmPC Section 4.8 paragraphs
+            smpc_paragraphs = self._find_smpc_section_48_paragraphs(doc)
+            if not smpc_paragraphs:
+                return False, updates
+
+            # Replace original text with country blocks in each relevant paragraph
+            blocks_inserted = False
+            for para in smpc_paragraphs:
+                try:
+                    from .document_utils import replace_original_text_with_country_blocks
+                except ImportError:
+                    from document_utils import replace_original_text_with_country_blocks
+                if replace_original_text_with_country_blocks(para, original_text, country_blocks):
+                    blocks_inserted = True
+                    break  # Usually only one paragraph contains the target text
+
+            if blocks_inserted:
                 success = True
                 updates.append("SmPC Section 4.8")
-            
-            # PL Section 4 updates  
-            pl_text = mapping_row.get('Section 4 PL Text', '')
-            if pl_text and str(pl_text).lower() != 'nan':
+
+        except Exception as e:
+            print(f"Error updating SmPC blocks: {e}")
+
+        return success, updates
+
+    def _build_smpc_country_blocks(self, mapping_row: pd.Series) -> List[Dict]:
+        """
+        Build formatted country blocks from mapping data.
+
+        Returns list of country blocks with lines, bold_texts, and hyperlinks.
+        """
+        country_blocks = []
+
+        try:
+            # Parse countries from Line 1 - Country names to be bolded - SmPC
+            country_bold_text = mapping_row.get('Line 1 - Country names to be bolded - SmPC', '')
+            if not country_bold_text or str(country_bold_text).lower() in ['nan', '']:
+                return country_blocks
+
+            # Split countries by comma/semicolon
+            import re
+            countries = [c.strip() for c in re.split('[,;]', country_bold_text) if c.strip()]
+
+            # Get all line texts (Lines 1-10)
+            line_texts = []
+            for i in range(1, 11):
+                line_key = f'Line {i} - SmPC'
+                line_text = mapping_row.get(line_key, '')
+                if line_text and str(line_text).lower() not in ['nan', '']:
+                    line_texts.append(str(line_text))
+
+            if not line_texts:
+                return country_blocks
+
+            # Get hyperlink data
+            hyperlinks_text = mapping_row.get('Hyperlinks SmPC', '')
+            hyperlinks_urls = mapping_row.get('Link for email - SmPC', '')
+
+            # Parse hyperlinks
+            hyperlink_data = self._parse_hyperlink_data(hyperlinks_text, hyperlinks_urls)
+
+            # Create one block per country (or single block if multiple countries share same text)
+            # For now, create single block with all countries - can be refined later
+            country_block = {
+                'lines': line_texts,
+                'bold_texts': countries,
+                'hyperlinks': hyperlink_data
+            }
+            country_blocks.append(country_block)
+
+        except Exception as e:
+            print(f"Error building SmPC country blocks: {e}")
+
+        return country_blocks
+
+    def _parse_hyperlink_data(self, hyperlinks_text: str, hyperlinks_urls: str) -> List[Dict]:
+        """
+        Parse hyperlink text and URLs from mapping columns.
+
+        Args:
+            hyperlinks_text: e.g., "national reporting system, Appendix V"
+            hyperlinks_urls: e.g., "https://url1.com, adr@example.com"
+
+        Returns:
+            List of {'text': 'url.com', 'url': 'url.com'} dicts
+        """
+        hyperlink_data = []
+
+        try:
+            if not hyperlinks_urls or str(hyperlinks_urls).lower() in ['nan', '', '*n/a*']:
+                return hyperlink_data
+
+            # Split URLs by comma
+            import re
+            urls = [u.strip() for u in re.split('[,;]', str(hyperlinks_urls)) if u.strip()]
+
+            # For each URL, the hyperlink text is the URL itself (as per your clarification)
+            for url in urls:
+                if url and url.lower() not in ['*n/a*', 'nan']:
+                    hyperlink_data.append({
+                        'text': url,  # The visible text is the URL/email itself
+                        'url': url    # The target is the same URL/email
+                    })
+
+        except Exception as e:
+            print(f"Error parsing hyperlink data: {e}")
+
+        return hyperlink_data
+
+    def _find_smpc_section_48_paragraphs(self, doc: Document) -> List:
+        """
+        Find paragraphs in SmPC Section 4.8 that contain reporting information.
+
+        Looks for sections containing "4.8" and "adverse" or "undesirable" effects.
+        """
+        section_paragraphs = []
+
+        try:
+            for para in doc.paragraphs:
+                para_text = para.text.lower()
+
+                # Look for Section 4.8 indicators
+                if ("4.8" in para_text and
+                    ("adverse" in para_text or "undesirable" in para_text or
+                     "reporting" in para_text or "suspected" in para_text)):
+                    section_paragraphs.append(para)
+
+        except Exception as e:
+            print(f"Error finding SmPC Section 4.8 paragraphs: {e}")
+
+        return section_paragraphs
+
+    def _update_document_with_fixed_pl_blocks(self, doc: Document, mapping_row: pd.Series) -> Tuple[bool, List[str]]:
+        """
+        Update PL Section 4 with multi-country formatted text blocks.
+
+        Reuses SmPC text block construction logic and appends PL-specific text.
+        """
+        updates = []
+        success = False
+
+        try:
+            # SmPC/PL Consistency Validation
+            smpc_text = mapping_row.get('National reporting system SmPC', '')
+            pl_text = mapping_row.get('National reporting system PL', '')
+
+            if smpc_text != pl_text and both_exist(smpc_text, pl_text):
+                print(f"⚠️  Warning: SmPC text differs from PL text - using SmPC base")
+                print(f"    SmPC: {smpc_text[:50]}...")
+                print(f"    PL: {pl_text[:50]}...")
+
+            # Get original text to replace
+            original_text = mapping_row.get('Original text national reporting - PL', '')
+            if not original_text or str(original_text).lower() in ['nan', '']:
+                return False, updates
+
+            # Build PL country blocks (reuse SmPC logic + append PL text)
+            country_blocks = self._build_pl_country_blocks(mapping_row)
+            if not country_blocks:
+                return False, updates
+
+            # Find PL Section 4 paragraphs
+            pl_paragraphs = self._find_pl_section_4_paragraphs(doc)
+            if not pl_paragraphs:
+                return False, updates
+
+            # Replace original text with country blocks in each relevant paragraph
+            blocks_inserted = False
+            for para in pl_paragraphs:
+                try:
+                    from .document_utils import replace_original_text_with_country_blocks
+                except ImportError:
+                    from document_utils import replace_original_text_with_country_blocks
+                if replace_original_text_with_country_blocks(para, original_text, country_blocks):
+                    blocks_inserted = True
+                    break  # Usually only one paragraph contains the target text
+
+            if blocks_inserted:
                 success = True
                 updates.append("PL Section 4")
-                
-        except Exception:
-            pass
-            
+
+        except Exception as e:
+            print(f"Error updating PL blocks: {e}")
+
         return success, updates
+
+    def _build_pl_country_blocks(self, mapping_row: pd.Series) -> List[Dict]:
+        """
+        Build PL country blocks by reusing SmPC logic and appending PL-specific text.
+        """
+        try:
+            # Start with SmPC country blocks
+            country_blocks = self._build_smpc_country_blocks(mapping_row)
+
+            # Get PL-specific text to append
+            pl_append_text = mapping_row.get('Text to be appended after National reporting system PL', '')
+
+            # Append PL text to each country block
+            if pl_append_text and str(pl_append_text).lower() not in ['nan', '']:
+                for block in country_blocks:
+                    # Add the append text as a new line
+                    block['lines'].append(str(pl_append_text))
+
+            return country_blocks
+
+        except Exception as e:
+            print(f"Error building PL country blocks: {e}")
+            return []
+
+    def _find_pl_section_4_paragraphs(self, doc: Document) -> List:
+        """
+        Find paragraphs in PL Section 4 that contain side effects information.
+
+        Looks for sections containing "4" or "section 4" and "side effects" or "adverse".
+        """
+        section_paragraphs = []
+
+        try:
+            for para in doc.paragraphs:
+                para_text = para.text.lower()
+
+                # Look for PL Section 4 indicators
+                if (("4." in para_text or "section 4" in para_text) and
+                    ("side effects" in para_text or "adverse" in para_text or
+                     "reporting" in para_text or "suspected" in para_text)):
+                    section_paragraphs.append(para)
+
+        except Exception as e:
+            print(f"Error finding PL Section 4 paragraphs: {e}")
+
+        return section_paragraphs
+
+
+def both_exist(text1: str, text2: str) -> bool:
+    """Helper function to check if both texts exist and are not nan/empty."""
+    return (text1 and str(text1).lower() not in ['nan', ''] and
+            text2 and str(text2).lower() not in ['nan', ''])
 
 
 class DocumentProcessor:
