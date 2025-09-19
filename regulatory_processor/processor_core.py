@@ -424,7 +424,9 @@ class DocumentProcessor:
         
         return logger
     
-    def process_folder(self, folder_path: str, mapping_path: str) -> ProcessingResult:
+    def process_folder(
+        self, folder_path: str, mapping_path: Optional[str] = None
+    ) -> ProcessingResult:
         """Main entry point for processing a folder of documents."""
         try:
             self.logger.info("=" * 80)
@@ -480,18 +482,24 @@ class DocumentProcessor:
             raise ValidationError(f"Invalid directory: {folder_path}")
         return folder
     
-    def _load_and_validate_mapping(self, mapping_path: str) -> MappingTable:
-        """Load and validate mapping file."""
+    def _load_and_validate_mapping(self, mapping_path: Optional[str]) -> MappingTable:
+        """Load and validate mapping file (custom if provided; otherwise default)."""
         try:
             mapping_table = load_mapping_table(mapping_path, self.config)
             if mapping_table is None or len(mapping_table) == 0:
-                raise MappingError(f"Could not load mapping file: {mapping_path}")
-            
-            self.logger.info(f"Mapping loaded: {len(mapping_table)} configurations")
+                if mapping_path:
+                    raise MappingError(f"Could not load mapping file: {mapping_path}")
+                raise MappingError("Default mapping table could not be loaded")
+
+            source = mapping_path if mapping_path else "built-in default"
+            self.logger.info(
+                f"Mapping loaded from {source}: {len(mapping_table)} configurations"
+            )
             return mapping_table
-            
+
         except Exception as e:
             raise MappingError(f"Failed to load mapping file: {e}")
+
     
     def _process_single_document(
         self,
@@ -708,7 +716,7 @@ class DocumentProcessor:
         )
 
 
-def process_folder(folder: str, mapping_path: str) -> None:
+def process_folder(folder: str, mapping_path: Optional[str] = None) -> None:
     """Legacy wrapper function for backward compatibility."""
     try:
         processor = DocumentProcessor()
@@ -728,8 +736,8 @@ def process_folder(folder: str, mapping_path: str) -> None:
 
 
 def process_folder_enhanced(
-    folder: str, 
-    mapping_path: str, 
+    folder: str,
+    mapping_path: Optional[str] = None,
     config: Optional[ProcessingConfig] = None
 ) -> ProcessingResult:
     """Enhanced entry point that returns detailed results."""

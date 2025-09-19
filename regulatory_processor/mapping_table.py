@@ -220,7 +220,8 @@ class MappingTable:
     """Container for mapping rows with multiple lookup strategies."""
 
     def __init__(self, dataframe: pd.DataFrame, config: ProcessingConfig):
-        self.dataframe = dataframe
+        # Defensive copy to avoid caller-side mutations affecting internal state.
+        self.dataframe = dataframe.copy()
         self.config = config
         self.rows: List[MappingRow] = [
             MappingRow(index=i, series=dataframe.iloc[i], delimiter=config.country_delimiter)
@@ -236,15 +237,18 @@ class MappingTable:
 
     @classmethod
     def from_excel(cls, file_path: str | Path, config: Optional[ProcessingConfig] = None) -> "MappingTable":
-        """Load, validate, and parse the mapping workbook."""
-
+        """Load, validate, and parse the mapping workbook from an Excel file."""
         cfg = config or ProcessingConfig()
         path = Path(file_path)
         try:
             dataframe = pd.read_excel(path)
         except Exception as exc:  # pragma: no cover - pandas handles specifics
             raise MappingError(f"Failed to read mapping file '{file_path}': {exc}") from exc
+        return cls.from_dataframe(dataframe=dataframe, config=cfg)
 
+    @classmethod
+    def from_dataframe(cls, dataframe: pd.DataFrame, config: Optional[ProcessingConfig] = None) -> "MappingTable":
+        """Construct a mapping table from a pre-loaded dataframe and validate required structure."""
         if dataframe.empty:
             raise MappingError("Mapping workbook does not contain any rows")
 
@@ -254,7 +258,9 @@ class MappingTable:
                 "Mapping workbook is missing required columns: " + ", ".join(sorted(missing))
             )
 
+        cfg = config or ProcessingConfig()
         return cls(dataframe=dataframe, config=cfg)
+
 
     # ------------------------------------------------------------------
     # Lookup helpers
