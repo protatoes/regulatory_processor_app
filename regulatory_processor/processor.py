@@ -152,15 +152,290 @@ except Exception as e:
         raise RuntimeError(f"Failed to convert {doc_path} to PDF: All methods failed")
 
 def copy_paragraph(dest_doc: Document, source_para: Paragraph) -> None:
-    """Copy a paragraph from one document to another, preserving runs."""
+    """Copy a paragraph from one document to another, preserving comprehensive formatting."""
     new_para = dest_doc.add_paragraph()
+
+    # Copy paragraph-level formatting
     new_para.style = source_para.style
+
+    # Copy paragraph format properties
+    if source_para.paragraph_format:
+        pf_source = source_para.paragraph_format
+        pf_dest = new_para.paragraph_format
+
+        # Copy alignment
+        if pf_source.alignment is not None:
+            pf_dest.alignment = pf_source.alignment
+
+        # Copy spacing
+        if pf_source.space_before is not None:
+            pf_dest.space_before = pf_source.space_before
+        if pf_source.space_after is not None:
+            pf_dest.space_after = pf_source.space_after
+        if pf_source.line_spacing is not None:
+            pf_dest.line_spacing = pf_source.line_spacing
+
+        # Copy indentation
+        if pf_source.left_indent is not None:
+            pf_dest.left_indent = pf_source.left_indent
+        if pf_source.right_indent is not None:
+            pf_dest.right_indent = pf_source.right_indent
+        if pf_source.first_line_indent is not None:
+            pf_dest.first_line_indent = pf_source.first_line_indent
+
+    # Copy all runs with comprehensive formatting
     for run in source_para.runs:
         new_run = new_para.add_run(run.text)
+
+        # Copy basic formatting
         new_run.bold = run.bold
         new_run.italic = run.italic
         new_run.underline = run.underline
         new_run.style = run.style
+
+        # Copy font properties
+        if run.font:
+            if run.font.name:
+                new_run.font.name = run.font.name
+            if run.font.size:
+                new_run.font.size = run.font.size
+            if run.font.color.rgb:
+                new_run.font.color.rgb = run.font.color.rgb
+            if run.font.highlight_color:
+                new_run.font.highlight_color = run.font.highlight_color
+
+
+def copy_table(dest_doc: Document, source_table) -> None:
+    """Copy a table from source document to destination document, preserving formatting."""
+    # Get table dimensions
+    rows = len(source_table.rows)
+    cols = len(source_table.columns) if source_table.rows else 0
+
+    if rows == 0 or cols == 0:
+        return
+
+    # Create new table
+    new_table = dest_doc.add_table(rows=rows, cols=cols)
+
+    # Copy table style if available
+    if hasattr(source_table, 'style') and source_table.style:
+        new_table.style = source_table.style
+
+    # Copy cell content and formatting
+    for row_idx, source_row in enumerate(source_table.rows):
+        dest_row = new_table.rows[row_idx]
+
+        for col_idx, source_cell in enumerate(source_row.cells):
+            dest_cell = dest_row.cells[col_idx]
+
+            # Clear default paragraph in destination cell
+            dest_cell.text = ""
+            if dest_cell.paragraphs:
+                dest_cell.paragraphs[0].clear()
+
+            # Copy all paragraphs from source cell
+            for para_idx, source_para in enumerate(source_cell.paragraphs):
+                if para_idx == 0 and dest_cell.paragraphs:
+                    # Use existing first paragraph
+                    dest_para = dest_cell.paragraphs[0]
+                    # Copy paragraph content manually
+                    _copy_paragraph_content(dest_para, source_para)
+                else:
+                    # Add new paragraph
+                    dest_para = dest_cell.add_paragraph()
+                    _copy_paragraph_content(dest_para, source_para)
+
+
+def _copy_paragraph_content(dest_para, source_para) -> None:
+    """Helper function to copy paragraph content without creating a new paragraph."""
+    # Copy paragraph-level formatting
+    dest_para.style = source_para.style
+
+    # Copy paragraph format properties
+    if source_para.paragraph_format:
+        pf_source = source_para.paragraph_format
+        pf_dest = dest_para.paragraph_format
+
+        if pf_source.alignment is not None:
+            pf_dest.alignment = pf_source.alignment
+        if pf_source.space_before is not None:
+            pf_dest.space_before = pf_source.space_before
+        if pf_source.space_after is not None:
+            pf_dest.space_after = pf_source.space_after
+        if pf_source.line_spacing is not None:
+            pf_dest.line_spacing = pf_source.line_spacing
+        if pf_source.left_indent is not None:
+            pf_dest.left_indent = pf_source.left_indent
+        if pf_source.right_indent is not None:
+            pf_dest.right_indent = pf_source.right_indent
+        if pf_source.first_line_indent is not None:
+            pf_dest.first_line_indent = pf_source.first_line_indent
+
+    # Copy all runs
+    for run in source_para.runs:
+        new_run = dest_para.add_run(run.text)
+
+        # Copy formatting
+        new_run.bold = run.bold
+        new_run.italic = run.italic
+        new_run.underline = run.underline
+        new_run.style = run.style
+
+        if run.font:
+            if run.font.name:
+                new_run.font.name = run.font.name
+            if run.font.size:
+                new_run.font.size = run.font.size
+            if run.font.color.rgb:
+                new_run.font.color.rgb = run.font.color.rgb
+            if run.font.highlight_color:
+                new_run.font.highlight_color = run.font.highlight_color
+
+
+def copy_document_structure(source_doc: Document, dest_doc: Document) -> None:
+    """Copy document structure elements like headers, footers, and page setup."""
+
+    try:
+        # Copy document properties
+        if hasattr(source_doc.core_properties, 'title') and source_doc.core_properties.title:
+            dest_doc.core_properties.title = source_doc.core_properties.title
+        if hasattr(source_doc.core_properties, 'author') and source_doc.core_properties.author:
+            dest_doc.core_properties.author = source_doc.core_properties.author
+        if hasattr(source_doc.core_properties, 'subject') and source_doc.core_properties.subject:
+            dest_doc.core_properties.subject = source_doc.core_properties.subject
+    except Exception as e:
+        print(f"⚠️ Could not copy document properties: {e}")
+
+    try:
+        # Copy page setup from first section
+        if source_doc.sections and dest_doc.sections:
+            source_section = source_doc.sections[0]
+            dest_section = dest_doc.sections[0]
+
+            # Copy page dimensions and margins
+            dest_section.page_height = source_section.page_height
+            dest_section.page_width = source_section.page_width
+            dest_section.left_margin = source_section.left_margin
+            dest_section.right_margin = source_section.right_margin
+            dest_section.top_margin = source_section.top_margin
+            dest_section.bottom_margin = source_section.bottom_margin
+            dest_section.gutter = source_section.gutter
+
+            # Copy orientation
+            dest_section.orientation = source_section.orientation
+    except Exception as e:
+        print(f"⚠️ Could not copy page setup: {e}")
+
+
+def copy_headers_and_footers(source_doc: Document, dest_doc: Document) -> None:
+    """Copy headers and footers from source document to destination document."""
+
+    try:
+        # Ensure destination has at least one section
+        if not dest_doc.sections:
+            return
+
+        source_section = source_doc.sections[0] if source_doc.sections else None
+        dest_section = dest_doc.sections[0]
+
+        if not source_section:
+            return
+
+        # Copy headers
+        header_types = [
+            ('first_page_header', 'first_page_header'),
+            ('even_page_header', 'even_page_header'),
+            ('header', 'header')  # Default header
+        ]
+
+        for source_attr, dest_attr in header_types:
+            try:
+                if hasattr(source_section, source_attr) and hasattr(dest_section, dest_attr):
+                    source_header = getattr(source_section, source_attr)
+                    dest_header = getattr(dest_section, dest_attr)
+
+                    # Clear existing content
+                    for para in dest_header.paragraphs:
+                        para.clear()
+
+                    # Copy paragraphs from source header
+                    for i, source_para in enumerate(source_header.paragraphs):
+                        if i < len(dest_header.paragraphs):
+                            _copy_paragraph_content(dest_header.paragraphs[i], source_para)
+                        else:
+                            dest_header_para = dest_header.add_paragraph()
+                            _copy_paragraph_content(dest_header_para, source_para)
+
+            except Exception as e:
+                print(f"⚠️ Could not copy header {source_attr}: {e}")
+
+        # Copy footers
+        footer_types = [
+            ('first_page_footer', 'first_page_footer'),
+            ('even_page_footer', 'even_page_footer'),
+            ('footer', 'footer')  # Default footer
+        ]
+
+        for source_attr, dest_attr in footer_types:
+            try:
+                if hasattr(source_section, source_attr) and hasattr(dest_section, dest_attr):
+                    source_footer = getattr(source_section, source_attr)
+                    dest_footer = getattr(dest_section, dest_attr)
+
+                    # Clear existing content
+                    for para in dest_footer.paragraphs:
+                        para.clear()
+
+                    # Copy paragraphs from source footer
+                    for i, source_para in enumerate(source_footer.paragraphs):
+                        if i < len(dest_footer.paragraphs):
+                            _copy_paragraph_content(dest_footer.paragraphs[i], source_para)
+                        else:
+                            dest_footer_para = dest_footer.add_paragraph()
+                            _copy_paragraph_content(dest_footer_para, source_para)
+
+            except Exception as e:
+                print(f"⚠️ Could not copy footer {source_attr}: {e}")
+
+    except Exception as e:
+        print(f"⚠️ Could not copy headers and footers: {e}")
+
+
+def copy_styles(source_doc: Document, dest_doc: Document) -> None:
+    """Copy custom styles from source document to destination document."""
+
+    try:
+        # Get style collections
+        source_styles = source_doc.styles
+        dest_styles = dest_doc.styles
+
+        # Copy paragraph styles
+        for source_style in source_styles:
+            if source_style.type == 1:  # Paragraph style
+                try:
+                    # Check if style already exists
+                    existing_style = None
+                    try:
+                        existing_style = dest_styles[source_style.name]
+                    except KeyError:
+                        pass
+
+                    if not existing_style:
+                        # Create new style
+                        new_style = dest_styles.add_style(source_style.name, 1)  # 1 = paragraph style
+
+                        # Copy basic properties
+                        if hasattr(source_style, 'font') and hasattr(new_style, 'font'):
+                            if source_style.font.name:
+                                new_style.font.name = source_style.font.name
+                            if source_style.font.size:
+                                new_style.font.size = source_style.font.size
+
+                except Exception as e:
+                    print(f"⚠️ Could not copy style {source_style.name}: {e}")
+
+    except Exception as e:
+        print(f"⚠️ Could not copy styles: {e}")
 
 # ============================================================================= 
 # CONSTANTS AND CONFIGURATION
@@ -1664,20 +1939,78 @@ def split_annexes_enhanced(source_path: str, output_dir: str, language: str, cou
     print(f"   Annex I: paragraphs 0 to {annex_ii_split_index - 1}")
     print(f"   Annex II: paragraphs {annex_ii_split_index} to {annex_iiib_split_index - 1}")
     print(f"   Annex IIIB: paragraphs {annex_iiib_split_index} to end")
-    
+
     # Create new documents
     annex_i_doc = Document()
     annex_iiib_doc = Document()
-    
-    # Split the document based on identified boundaries
-    for idx, para in enumerate(doc.paragraphs):
-        if idx < annex_ii_split_index:
+
+    # Copy document structure (headers, footers, page setup, styles) to both new documents
+    print("📋 Copying document structure (headers, footers, page setup)...")
+    copy_document_structure(doc, annex_i_doc)
+    copy_document_structure(doc, annex_iiib_doc)
+
+    print("📋 Copying headers and footers...")
+    copy_headers_and_footers(doc, annex_i_doc)
+    copy_headers_and_footers(doc, annex_iiib_doc)
+
+    print("📋 Copying document styles...")
+    copy_styles(doc, annex_i_doc)
+    copy_styles(doc, annex_iiib_doc)
+
+    # Split the document based on identified boundaries, handling all document elements
+    # We need to track both paragraphs and tables in document order
+    element_index = 0
+
+    # Process all document elements (paragraphs and tables) in order
+    from docx.document import Document as DocxDocument
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    # Get all document elements in order
+    document_elements = []
+    for element in doc.element.body:
+        if element.tag.endswith('p'):  # Paragraph
+            para_index = element_index
+            if para_index < len(doc.paragraphs):
+                document_elements.append(('paragraph', para_index, doc.paragraphs[para_index]))
+        elif element.tag.endswith('tbl'):  # Table
+            # Find the corresponding table object
+            table_index = len([e for e in document_elements if e[0] == 'table'])
+            if table_index < len(doc.tables):
+                document_elements.append(('table', element_index, doc.tables[table_index]))
+        element_index += 1
+
+    # Now process elements based on paragraph boundaries
+    # Map paragraph indices to element positions
+    para_to_element_map = {}
+    element_to_para_map = {}
+    para_count = 0
+
+    for elem_idx, (elem_type, _, elem_obj) in enumerate(document_elements):
+        if elem_type == 'paragraph':
+            para_to_element_map[para_count] = elem_idx
+            element_to_para_map[elem_idx] = para_count
+            para_count += 1
+
+    # Split elements based on paragraph boundaries
+    annex_ii_element_boundary = para_to_element_map.get(annex_ii_split_index, len(document_elements))
+    annex_iiib_element_boundary = para_to_element_map.get(annex_iiib_split_index, len(document_elements))
+
+    # Copy elements to appropriate documents
+    for elem_idx, (elem_type, _, elem_obj) in enumerate(document_elements):
+        if elem_idx < annex_ii_element_boundary:
             # Annex I content (everything before Annex II)
-            copy_paragraph(annex_i_doc, para)
-        elif idx >= annex_iiib_split_index:
+            if elem_type == 'paragraph':
+                copy_paragraph(annex_i_doc, elem_obj)
+            elif elem_type == 'table':
+                copy_table(annex_i_doc, elem_obj)
+        elif elem_idx >= annex_iiib_element_boundary:
             # Annex IIIB content (everything from Annex IIIB header onwards)
-            copy_paragraph(annex_iiib_doc, para)
-        # Note: We skip Annex II content (between annex_ii_split_index and annex_iiib_split_index)
+            if elem_type == 'paragraph':
+                copy_paragraph(annex_iiib_doc, elem_obj)
+            elif elem_type == 'table':
+                copy_table(annex_iiib_doc, elem_obj)
+        # Note: We skip Annex II content (between boundaries)
         # as we only need Annex I and Annex IIIB for the final output
     
     # Generate output paths
