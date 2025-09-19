@@ -54,6 +54,12 @@ from .utils import (
     identify_document_country_and_language, find_mapping_rows_for_language,
     generate_output_filename, load_mapping_table
 )
+from .hyperlinks import (
+    URLValidationResult, URLAccessibilityResult, URLValidationConfig,
+    validate_url_format, test_url_accessibility, add_hyperlink_relationship,
+    create_hyperlink_run_enhanced, create_hyperlink_element,
+    create_styled_text_fallback_element, validate_and_test_url_complete
+)
 
 # Define utility functions that are processor-specific
 def convert_to_pdf(doc_path: str, output_dir: str) -> str:
@@ -155,12 +161,6 @@ def copy_paragraph(dest_doc: Document, source_para: Paragraph) -> None:
         new_run.italic = run.italic
         new_run.underline = run.underline
         new_run.style = run.style
-from .hyperlinks import (
-    URLValidationResult, URLAccessibilityResult, URLValidationConfig,
-    validate_url_format, test_url_accessibility, add_hyperlink_relationship,
-    create_hyperlink_run_enhanced, create_hyperlink_element,
-    create_styled_text_fallback_element, validate_and_test_url_complete
-)
 
 # ============================================================================= 
 # CONSTANTS AND CONFIGURATION
@@ -1344,7 +1344,7 @@ def create_pl_replacement_block(mapping_row: pd.Series, country_delimiter: str =
     return '\n\n'.join(full_content) if full_content else ''
 
 
-def update_section_10_date(doc: Document, mapping_row: pd.Series) -> bool:
+def update_section_10_date(doc: Document, mapping_row: pd.Series, mapping_file_path: Optional[str] = None) -> bool:
     """Update date in Annex I Section 10."""
     country = mapping_row.get('Country', '')
     date_header = mapping_row.get('Annex I Date Text', 'Date of first authorisation/renewal of the authorisation')
@@ -1353,6 +1353,13 @@ def update_section_10_date(doc: Document, mapping_row: pd.Series) -> bool:
         return False
     
     try:
+        # Ensure date formatter is initialized
+        if mapping_file_path:
+            try:
+                get_date_formatter()
+            except RuntimeError:
+                initialize_date_formatter(mapping_file_path)
+
         formatted_date = format_date_for_country(country, 'annex_i')
     except Exception:
         date_format = mapping_row.get('Annex I Date Format', '')
@@ -1375,7 +1382,7 @@ def update_section_10_date(doc: Document, mapping_row: pd.Series) -> bool:
     
     return found
 
-def update_annex_iiib_date(doc: Document, mapping_row: pd.Series) -> bool:
+def update_annex_iiib_date(doc: Document, mapping_row: pd.Series, mapping_file_path: Optional[str] = None) -> bool:
     """Update date in Annex IIIB Section 6."""
     country = mapping_row.get('Country', '')
     date_text = mapping_row.get('Annex IIIB Date Text', 'This leaflet was last revised in')
@@ -1384,6 +1391,13 @@ def update_annex_iiib_date(doc: Document, mapping_row: pd.Series) -> bool:
         return False
     
     try:
+        # Ensure date formatter is initialized
+        if mapping_file_path:
+            try:
+                get_date_formatter()
+            except RuntimeError:
+                initialize_date_formatter(mapping_file_path)
+
         formatted_date = format_date_for_country(country, 'annex_iiib')
     except Exception:
         formatted_date = datetime.now().strftime("%d %B %Y")
@@ -2493,7 +2507,7 @@ class DocumentUpdater:
         self.config = config
         self.logger = logging.getLogger(f"{__name__}.DocumentUpdater")
     
-    def apply_all_updates(self, doc: Document, mapping_row: pd.Series) -> Tuple[bool, List[str]]:
+    def apply_all_updates(self, doc: Document, mapping_row: pd.Series, mapping_file_path: Optional[str] = None) -> Tuple[bool, List[str]]:
         """Apply all required updates to a document."""
         updates_applied = []
         total_success = False
@@ -2506,12 +2520,12 @@ class DocumentUpdater:
                 total_success = True
             
             # 2. Update dates
-            annex_i_date_success = update_section_10_date(doc, mapping_row)
+            annex_i_date_success = update_section_10_date(doc, mapping_row, mapping_file_path)
             if annex_i_date_success:
                 updates_applied.append("Annex I dates")
                 total_success = True
-            
-            annex_iiib_date_success = update_annex_iiib_date(doc, mapping_row)
+
+            annex_iiib_date_success = update_annex_iiib_date(doc, mapping_row, mapping_file_path)
             if annex_iiib_date_success:
                 updates_applied.append("Annex IIIB dates")
                 total_success = True
@@ -2560,6 +2574,10 @@ class DocumentProcessor:
             # Validate inputs
             folder = self._validate_folder_path(folder_path)
             mapping_df = self._load_and_validate_mapping(mapping_path)
+
+            # Initialize date formatter with mapping file
+            initialize_date_formatter(mapping_path)
+            self.logger.info("✅ Date formatter initialized")
             
             # Setup processing environment
             file_manager = FileManager(folder, self.config)
@@ -2580,7 +2598,7 @@ class DocumentProcessor:
             for document_path in documents:
                 try:
                     result = self._process_single_document(
-                        document_path, mapping_df, file_manager, split_dir, pdf_dir
+                        document_path, mapping_df, file_manager, split_dir, pdf_dir, mapping_path
                     )
                     output_files.extend(result.output_files)
                     
@@ -2625,7 +2643,8 @@ class DocumentProcessor:
         mapping_df: pd.DataFrame,
         file_manager: FileManager,
         split_dir: Path,
-        pdf_dir: Path
+        pdf_dir: Path,
+        mapping_path: str
     ) -> ProcessingResult:
         """Process a single document with all its variants."""
         
@@ -2668,7 +2687,7 @@ class DocumentProcessor:
                 
                 try:
                     result = self._process_document_variant(
-                        document_path, mapping_row, split_dir, pdf_dir
+                        document_path, mapping_row, split_dir, pdf_dir, mapping_path
                     )
                     
                     if result.success:
@@ -2704,7 +2723,8 @@ class DocumentProcessor:
         document_path: Path,
         mapping_row: pd.Series,
         split_dir: Path,
-        pdf_dir: Path
+        pdf_dir: Path,
+        mapping_path: str
     ) -> ProcessingResult:
         """Process a single document variant."""
         
@@ -2717,7 +2737,7 @@ class DocumentProcessor:
             
             # Apply updates
             updater = DocumentUpdater(self.config)
-            updates_made, updates_applied = updater.apply_all_updates(doc, mapping_row)
+            updates_made, updates_applied = updater.apply_all_updates(doc, mapping_row, mapping_path)
             
             if not updates_made:
                 return ProcessingResult(
