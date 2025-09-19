@@ -52,7 +52,7 @@ from .date_formatter import (
 from .utils import (
     get_country_code_mapping, extract_country_code_from_filename,
     identify_document_country_and_language, find_mapping_rows_for_language,
-    generate_output_filename, load_mapping_table
+    generate_output_filename, load_mapping_table, is_header_match
 )
 from .hyperlinks import (
     URLValidationResult, URLAccessibilityResult, URLValidationConfig,
@@ -1916,12 +1916,12 @@ def split_annexes_enhanced(source_path: str, output_dir: str, language: str, cou
         text = para.text.strip()
         
         # Look for Annex II header (case-insensitive, flexible matching)
-        if annex_ii_split_index is None and _is_header_match(text, annex_ii_header):
+        if annex_ii_split_index is None and is_header_match(text, annex_ii_header):
             annex_ii_split_index = idx
             print(f"✅ Found Annex II header at paragraph {idx}: '{text[:50]}...'")
-        
+
         # Look for Annex IIIB header (case-insensitive, flexible matching)
-        if annex_iiib_split_index is None and _is_header_match(text, annex_iiib_header):
+        if annex_iiib_split_index is None and is_header_match(text, annex_iiib_header):
             annex_iiib_split_index = idx
             print(f"✅ Found Annex IIIB header at paragraph {idx}: '{text[:50]}...'")
     
@@ -1966,52 +1966,72 @@ def split_annexes_enhanced(source_path: str, output_dir: str, language: str, cou
     from docx.table import Table
     from docx.text.paragraph import Paragraph
 
-    # Get all document elements in order
+    # Create ordered list of all document elements (paragraphs and tables) with correct indexing
     document_elements = []
+    paragraph_counter = 0
+    table_counter = 0
+
+    # Process document body elements in order to maintain document structure
     for element in doc.element.body:
-        if element.tag.endswith('p'):  # Paragraph
-            para_index = element_index
-            if para_index < len(doc.paragraphs):
-                document_elements.append(('paragraph', para_index, doc.paragraphs[para_index]))
-        elif element.tag.endswith('tbl'):  # Table
-            # Find the corresponding table object
-            table_index = len([e for e in document_elements if e[0] == 'table'])
-            if table_index < len(doc.tables):
-                document_elements.append(('table', element_index, doc.tables[table_index]))
-        element_index += 1
+        if element.tag.endswith('p'):  # Paragraph element
+            if paragraph_counter < len(doc.paragraphs):
+                document_elements.append(('paragraph', paragraph_counter, doc.paragraphs[paragraph_counter]))
+                paragraph_counter += 1
+        elif element.tag.endswith('tbl'):  # Table element
+            if table_counter < len(doc.tables):
+                document_elements.append(('table', table_counter, doc.tables[table_counter]))
+                table_counter += 1
 
-    # Now process elements based on paragraph boundaries
-    # Map paragraph indices to element positions
+    print(f"📊 Document structure analysis:")
+    print(f"   Total elements: {len(document_elements)}")
+    print(f"   Paragraphs: {paragraph_counter}")
+    print(f"   Tables: {table_counter}")
+
+    # Create mapping from paragraph index to element position for boundary calculation
     para_to_element_map = {}
-    element_to_para_map = {}
-    para_count = 0
+    element_para_count = 0
 
-    for elem_idx, (elem_type, _, elem_obj) in enumerate(document_elements):
+    for elem_idx, (elem_type, original_idx, _) in enumerate(document_elements):
         if elem_type == 'paragraph':
-            para_to_element_map[para_count] = elem_idx
-            element_to_para_map[elem_idx] = para_count
-            para_count += 1
+            para_to_element_map[element_para_count] = elem_idx
+            element_para_count += 1
 
-    # Split elements based on paragraph boundaries
+    # Calculate element boundaries based on paragraph split points
     annex_ii_element_boundary = para_to_element_map.get(annex_ii_split_index, len(document_elements))
     annex_iiib_element_boundary = para_to_element_map.get(annex_iiib_split_index, len(document_elements))
 
-    # Copy elements to appropriate documents
-    for elem_idx, (elem_type, _, elem_obj) in enumerate(document_elements):
+    print(f"📊 Element boundaries:")
+    print(f"   Annex I: elements 0 to {annex_ii_element_boundary - 1}")
+    print(f"   Annex II: elements {annex_ii_element_boundary} to {annex_iiib_element_boundary - 1}")
+    print(f"   Annex IIIB: elements {annex_iiib_element_boundary} to {len(document_elements) - 1}")
+
+    # Copy elements to appropriate documents in correct order
+    annex_i_elements = 0
+    annex_iiib_elements = 0
+
+    for elem_idx, (elem_type, original_idx, elem_obj) in enumerate(document_elements):
         if elem_idx < annex_ii_element_boundary:
             # Annex I content (everything before Annex II)
             if elem_type == 'paragraph':
                 copy_paragraph(annex_i_doc, elem_obj)
             elif elem_type == 'table':
                 copy_table(annex_i_doc, elem_obj)
+            annex_i_elements += 1
+
         elif elem_idx >= annex_iiib_element_boundary:
             # Annex IIIB content (everything from Annex IIIB header onwards)
             if elem_type == 'paragraph':
                 copy_paragraph(annex_iiib_doc, elem_obj)
             elif elem_type == 'table':
                 copy_table(annex_iiib_doc, elem_obj)
+            annex_iiib_elements += 1
+
         # Note: We skip Annex II content (between boundaries)
         # as we only need Annex I and Annex IIIB for the final output
+
+    print(f"📋 Elements copied:")
+    print(f"   Annex I: {annex_i_elements} elements")
+    print(f"   Annex IIIB: {annex_iiib_elements} elements")
     
     # Generate output paths
     base_name = Path(source_path).stem
@@ -2094,8 +2114,9 @@ def split_annexes_three_headers_xml(source_path: str, output_dir: str, language:
     print(f"   Annex IIIB: Paragraph {header_positions['annex_iiib']}")
     
     # Extract sections using XML manipulation
-    annex_i_doc = extract_section_xml(doc, 
-                                      start_idx=header_positions['annex_i'], 
+    # FIXED: Annex I should start from document beginning (0), not from Annex I header
+    annex_i_doc = extract_section_xml(doc,
+                                      start_idx=0,  # Document beginning, not header_positions['annex_i']
                                       end_idx=header_positions['annex_ii'])
     
     annex_iiib_doc = extract_section_xml(doc, 
@@ -2225,8 +2246,14 @@ def _extract_section_safe_copy(source_doc: Document, start_idx: int, end_idx: in
     
     # Create new document
     new_doc = Document()
-    
-    # Copy document-level settings safely
+
+    # TEMPORARILY DISABLED: Copy comprehensive document structure (causes process crash)
+    print("📋 Skipping document structure copying (debugging process crash)...")
+    # copy_document_structure(source_doc, new_doc)
+    # copy_headers_and_footers(source_doc, new_doc)
+    # copy_styles(source_doc, new_doc)
+
+    # Copy additional document-level settings safely
     _copy_document_settings_safe(source_doc, new_doc)
     
     # Clear the default empty paragraph
@@ -2255,7 +2282,8 @@ def _extract_section_safe_copy(source_doc: Document, start_idx: int, end_idx: in
             if start_idx <= current_para_idx < end_idx:
                 target_elements.append(element)
     
-    # Copy the selected elements safely
+    # TEMPORARILY REVERTING to safe functions to debug crash
+    print("📋 Using safe copying functions to isolate crash cause...")
     for element in target_elements:
         if element['type'] == 'paragraph':
             copy_paragraph_safe(new_doc, element['content'])
@@ -3133,9 +3161,17 @@ class DocumentProcessor:
                         self.logger.info(f"✅ Annex I PDF: {Path(pdf_annex_i).name}")
                     except Exception as e:
                         self.logger.warning(f"⚠️ Annex I PDF conversion failed: {e}")
-                    
-                    # Try converting Annex IIIB  
+
+                    # RESOURCE CLEANUP between conversions to prevent crashes
+                    import gc
+                    import time
+                    self.logger.info("🧹 Cleaning up resources between PDF conversions...")
+                    gc.collect()  # Force garbage collection
+                    time.sleep(3)  # Wait 3 seconds for resource cleanup
+
+                    # Try converting Annex IIIB
                     try:
+                        self.logger.info("🔄 Starting Annex IIIB PDF conversion...")
                         pdf_annex_iiib = convert_to_pdf(annex_iiib_path, str(pdf_dir))
                         output_files.append(pdf_annex_iiib)
                         self.logger.info(f"✅ Annex IIIB PDF: {Path(pdf_annex_iiib).name}")
