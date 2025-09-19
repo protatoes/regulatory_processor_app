@@ -20,34 +20,33 @@ from .mapping_table import MappingTable
 def load_mapping_table(
     file_path: Optional[str] = None, config: Optional[ProcessingConfig] = None
 ) -> Optional[MappingTable]:
-    """Load the mapping workbook, validate columns, and initialize date formatter."""
-
+    """Load a mapping table from an Excel file if provided; otherwise use the built-in default.
+    Validates columns and initializes the DateFormatterSystem from the resulting mapping.
+    """
     cfg = config or ProcessingConfig()
     table: Optional[MappingTable]
+    mapping_df: Optional[pd.DataFrame]
 
     if file_path:
         path = Path(file_path)
         if not path.exists():
             print(f"❌ Error: Mapping file not found: {file_path}")
             return None
-
         try:
             table = MappingTable.from_excel(path, cfg)
+            mapping_df = table.to_dataframe()
+            source_description = f"custom mapping '{file_path}'"
         except MappingError as exc:
             print(f"❌ Mapping validation error: {exc}")
             return None
         except Exception as exc:  # pragma: no cover - defensive
             print(f"❌ Unexpected error loading mapping file: {exc}")
             return None
-
-        mapping_df = table.to_dataframe()
-        source_description = f"custom mapping '{file_path}'"
     else:
         print("ℹ️ No mapping file provided. Loading built-in default mapping table.")
         try:
-            dataframe = load_default_mapping_dataframe()
-            table = MappingTable.from_dataframe(dataframe, cfg)
-            mapping_df = dataframe
+            mapping_df = load_default_mapping_dataframe()
+            table = MappingTable.from_dataframe(mapping_df, cfg)
             source_description = "built-in default mapping"
         except MappingError as exc:
             print(f"❌ Default mapping table is invalid: {exc}")
@@ -56,6 +55,7 @@ def load_mapping_table(
             print(f"❌ Unexpected error loading default mapping table: {exc}")
             return None
 
+    # Initialize the DateFormatterSystem using whatever mapping we ended up with
     print("🔧 Initializing DateFormatterSystem...")
     try:
         initialize_date_formatter(mapping_df)
@@ -65,9 +65,11 @@ def load_mapping_table(
             f"✅ DateFormatterSystem initialized with {len(available_countries)} countries from {source_description}"
         )
     except Exception as exc:
+        # Not fatal to overall mapping loading, but worth surfacing
         print(f"⚠️ Warning: Date formatter could not be initialized: {exc}")
 
     return table
+
 
 
 def get_country_code_mapping() -> Dict[str, Tuple[str, str]]:

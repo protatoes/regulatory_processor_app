@@ -483,7 +483,7 @@ class DocumentProcessor:
         return folder
     
     def _load_and_validate_mapping(self, mapping_path: Optional[str]) -> MappingTable:
-        """Load and validate mapping file."""
+        """Load and validate mapping file (custom if provided; otherwise default)."""
         try:
             mapping_table = load_mapping_table(mapping_path, self.config)
             if mapping_table is None or len(mapping_table) == 0:
@@ -499,6 +499,7 @@ class DocumentProcessor:
 
         except Exception as e:
             raise MappingError(f"Failed to load mapping file: {e}")
+
     
     def _process_single_document(
         self,
