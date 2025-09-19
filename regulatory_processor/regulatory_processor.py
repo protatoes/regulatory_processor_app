@@ -5,89 +5,115 @@ This module defines a Reflex application with a minimal user
 interface.  The user can enter the path to a folder containing
 combined SmPC Word files and the path to an Excel mapping file.  When
 the "Start Processing" button is pressed, the application invokes
-``processor.process_folder`` to update, split and convert the
-documents.  Progress is reported via a status field on the page.
-
-Reflex apps consist of two main parts: a state class that manages
-all of the server‑side state and events, and one or more page
-functions that build the HTML structure.  The state class must
-subclass ``rx.State`` and can define asynchronous methods that are
-called when the user interacts with the UI.
-
-For more information on how to build Reflex applications, refer to
-the official documentation.  The installation instructions at
-``reflex.dev`` explain how to use ``pip`` to install the framework
-and how to initialise a new project using ``reflex init``【338122900162100†L69-L96】.
-
+the processor in a background task to update, split and convert the
+documents. Progress is reported via a status field on the page.
 """
 
-
 import os
-from pathlib import Path
 import reflex as rx
 
+# Import the processor module and its necessary classes
 from . import processor
 
-
 class AppState(rx.State):
-    """Enhanced application state with better status reporting."""
+    """
+    Application state that uses background tasks to run the processor
+    without blocking the UI and causing worker timeouts.
+    """
     
     folder_path: str = ""
     mapping_path: str = ""
-    status: str = ""
+    status: str = "Please provide paths and start processing."
+    is_processing: bool = False
 
-    async def run_processing(self) -> None:
-        """Enhanced processing with better error reporting."""
+    # ### PART 1: THE STARTER EVENT HANDLER ###
+    # This is called when the user clicks the button. It sets the UI to a
+    # loading state and immediately starts the background task.
+    async def start_processing(self) -> None:
+        """
+        Validates inputs, sets the UI to a processing state, and
+        starts the document processing in a background task.
+        """
+        # Prevent starting a new process if one is already running
+        if self.is_processing:
+            return
+
         # Validate inputs
         folder = os.path.expanduser(self.folder_path.strip())
         mapping = os.path.expanduser(self.mapping_path.strip())
         
-        if not folder or not mapping:
-            self.status = "Please provide both folder and mapping paths."
+        if not folder or not os.path.isdir(folder):
+            self.status = "Error: The folder path is invalid or does not exist."
             return
         
-        # Start processing
-        self.status = "Processing... this may take a few minutes"
-        yield
+        if not mapping or not os.path.isfile(mapping):
+            self.status = "Error: The mapping file path is invalid or does not exist."
+            return
         
-        try:
-            # Use enhanced processor if available, fallback to original
-            if hasattr(processor, 'process_folder_enhanced'):
-                # Enhanced processing with detailed results
-                config = processor.ProcessingConfig(
-                    create_backups=True,
-                    convert_to_pdf=True,
-                    log_level="INFO"
-                )
-                
-                result = processor.process_folder_enhanced(folder, mapping, config)
-                
-                if result.success:
-                    # Extract statistics from result
-                    output_count = len(result.output_files)
-                    self.status = (
-                        f"Processing completed successfully! "
-                        f"Created {output_count} output files. "
-                        f"Updated documents saved in {folder}."
-                    )
-                else:
-                    self.status = f"Processing completed with issues: {result.message}"
-                    if result.errors:
-                        error_summary = "; ".join(result.errors[:2])  # Show first 2 errors
-                        self.status += f" Errors: {error_summary}"
-            else:
-                # Fallback to original processor
-                processor.process_folder(folder, mapping)
-                self.status = f"Processing completed. Updated documents saved in {folder}."
-                
-        except Exception as exc:
-            self.status = f"Error: {exc}"
+        # Set the UI to a loading state
+        self.is_processing = True
+        self.status = "Processing... this may take several minutes. Please do not close this window."
         
-        yield
+        # Kick off the background task
+        return AppState.run_processing_background
 
+    # ### PART 2: THE BACKGROUND TASK ###
+    # Decorated with @rx.event(background=True), this runs on a separate thread.
+    # It contains the slow, blocking call to your processor.
+    @rx.event(background=True)
+    async def run_processing_background(self) -> None:
+        """
+        Runs the heavy document processing logic in the background.
+        This function does not block the main app thread.
+        """
+        # Use 'async with self' to get a clean instance of the state
+        async with self:
+            folder = os.path.expanduser(self.folder_path.strip())
+            mapping = os.path.expanduser(self.mapping_path.strip())
+
+        try:
+            # This is the long-running, blocking call.
+            config = processor.ProcessingConfig(
+                create_backups=True,
+                convert_to_pdf=True,
+                log_level="INFO"
+            )
+            result = processor.process_folder_enhanced(folder, mapping, config)
+
+        except Exception as e:
+            # If the processor crashes, create an error result to show the user
+            result = processor.ProcessingResult(
+                success=False,
+                message="A fatal error occurred during processing.",
+                errors=[str(e)]
+            )
+        
+        # When the background task is done, it calls the finisher
+        # to update the UI on the main thread.
+        yield self.handle_processing_complete(result)
+
+    # ### PART 3: THE FINISHER EVENT HANDLER ###
+    # This is a regular event handler that is called by the background
+    # task. It safely updates the UI state with the final results.
+    def handle_processing_complete(self, result: processor.ProcessingResult):
+        """
+        Updates the UI state after the background processing is complete.
+        """
+        self.is_processing = False
+        if result.success:
+            output_count = len(result.output_files)
+            self.status = (
+                f"✅ Processing completed successfully! "
+                f"Created {output_count} output files."
+            )
+        else:
+            self.status = f"❌ Processing failed: {result.message}"
+            if result.errors:
+                error_summary = "; ".join(result.errors[:2])
+                self.status += f" Details: {error_summary}"
 
 def index() -> rx.Component:
-    """Compatible UI that works with current Reflex version."""
+    """The main user interface for the document processor."""
     return rx.center(
         rx.vstack(
             rx.heading(
@@ -99,27 +125,33 @@ def index() -> rx.Component:
             ),
             rx.input(
                 placeholder="/path/to/smpc/files",
-                value=AppState.folder_path,
                 on_change=AppState.set_folder_path,
                 width="100%",
             ),
             rx.text("Enter the absolute path to the Excel mapping file:"),
             rx.input(
                 placeholder="/path/to/Mapping Test.xlsx",
-                value=AppState.mapping_path,
                 on_change=AppState.set_mapping_path,
                 width="100%",
             ),
             rx.button(
                 "Start Processing",
-                on_click=AppState.run_processing,
+                # The on_click now calls our "starter" event handler
+                on_click=AppState.start_processing,
+                # The button is disabled while processing is in progress
+                is_disabled=AppState.is_processing,
                 width="100%",
                 color_scheme="teal",
             ),
-            rx.text(
-                AppState.status,
+            # Use a box with a border for the status to make it stand out
+            rx.box(
+                rx.text(AppState.status),
                 margin_top="1em",
-                font_style="italic",
+                padding="1em",
+                border="1px solid #ddd",
+                border_radius="md",
+                width="100%",
+                bg="#f9f9f9",
             ),
             width="600px",
             align="start",
@@ -127,7 +159,6 @@ def index() -> rx.Component:
         ),
         padding="2em",
     )
-
 
 # Create the Reflex application
 app = rx.App()
