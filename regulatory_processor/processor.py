@@ -38,483 +38,33 @@ from docx.oxml import OxmlElement
 from docx2pdf import convert
 
 # Import refactored modules
-from .hyperlinks import (
-    URLValidationResult, URLAccessibilityResult, URLValidationConfig,
-    validate_url_format, test_url_accessibility, add_hyperlink_relationship,
-    create_hyperlink_run_enhanced, create_hyperlink_element,
-    create_styled_text_fallback_element, validate_and_test_url_complete
+from .config import (
+    DirectoryNames, FileMarkers, SectionTypes,
+    ProcessingConfig, ProcessingResult, ProcessingStats
+)
+from .exceptions import (
+    ProcessingError, ValidationError, DocumentError, MappingError
+)
+from .date_formatter import (
+    DateFormatterSystem, initialize_date_formatter, get_date_formatter,
+    format_date_for_country, format_date
+)
+from .utils import (
+    get_country_code_mapping, extract_country_code_from_filename,
+    identify_document_country_and_language, find_mapping_rows_for_language,
+    generate_output_filename, load_mapping_table
 )
 
-# ============================================================================= 
-# CONSTANTS AND CONFIGURATION
-# =============================================================================
-
-class DirectoryNames:
-    SPLIT_DOCS = "split_docs"
-    PDF_DOCS = "pdf_docs"
-    BACKUP_SUFFIX = ".orig"
-
-class FileMarkers:
-    ANNEX_MARKER = "_Annex_"
-    TEMP_FILE_PREFIX = "~"
-    ANNEX_PREFIX = "Annex"
-
-class SectionTypes:
-    SMPC = "SmPC"
-    PL = "PL"
-
-# Custom Exceptions
-class ProcessingError(Exception):
-    """Base exception for document processing errors."""
-    pass
-
-class ValidationError(ProcessingError):
-    """Raised when input validation fails."""
-    pass
-
-class DocumentError(ProcessingError):
-    """Raised when document operations fail."""
-    pass
-
-class MappingError(ProcessingError):
-    """Raised when mapping file operations fail."""
-    pass
-
-# Result Types
-class ProcessingResult(NamedTuple):
-    success: bool
-    message: str
-    output_files: List[str] = []
-    errors: List[str] = []
-
-@dataclass
-class ProcessingStats:
-    """Tracks processing statistics throughout the workflow."""
-    input_files_found: int = 0
-    input_files_processed: int = 0
-    variants_processed: int = 0
-    variants_successful: int = 0
-    output_files_created: int = 0
-    errors_encountered: int = 0
-    
-    def success_rate(self) -> float:
-        """Calculate overall success rate."""
-        if self.variants_processed == 0:
-            return 0.0
-        return (self.variants_successful / self.variants_processed) * 100
-
-@dataclass
-class ProcessingConfig:
-    """Configuration settings for document processing."""
-    create_backups: bool = True
-    convert_to_pdf: bool = True
-    overwrite_existing: bool = False
-    log_level: str = "INFO"
-    country_delimiter: str = ";"
-
-# ============================================================================= 
-# DATE FORMATTING SYSTEM
-# =============================================================================
-
-class DateFormatterSystem:
-    """
-    A system for formatting dates based on country-specific formats defined in a mapping table.
-    Supports locale-specific month names and custom static text.
-    """
-    
-    def __init__(self, mapping_file_path: str):
-        """
-        Initialize the date formatter with a mapping file.
-        
-        Args:
-            mapping_file_path: Path to the Excel mapping file
-        """
-        self.mapping_df = pd.read_excel(mapping_file_path)
-        self.country_formats = self._load_country_formats()
-        self.locale_mapping = self._create_locale_mapping()
-        
-    def _load_country_formats(self) -> Dict[str, Dict[str, str]]:
-        """Load date formats from the mapping table."""
-        formats = {}
-        
-        for _, row in self.mapping_df.iterrows():
-            country = row['Country']
-            annex_i_format = row.get('Annex I Date Format', '')
-            annex_iiib_format = row.get('Annex IIIB Date Format', '')
-            
-            formats[country] = {
-                'annex_i': annex_i_format,
-                'annex_iiib': annex_iiib_format
-            }
-            
-        return formats
-    
-    def _create_locale_mapping(self) -> Dict[str, str]:
-        """
-        Create a mapping between countries and their locale codes.
-        This helps with getting proper month names.
-        """
-        locale_map = {
-            'België/Nederland': 'nl_NL.UTF-8',
-            'Belgique/Luxembourg': 'fr_FR.UTF-8', 
-            'Belgien/Luxemburg': 'de_DE.UTF-8',
-            'Estonia': 'et_EE.UTF-8',
-            'Greece/Cyprus': 'el_GR.UTF-8',
-            'Latvia': 'lv_LV.UTF-8',
-            'Lithuania': 'lt_LT.UTF-8',
-            'Portugal': 'pt_PT.UTF-8',
-            'Croatia': 'hr_HR.UTF-8',
-            'Slovenia': 'sl_SI.UTF-8',
-            'Finland': 'fi_FI.UTF-8',
-            'Sweden/Finland': 'sv_SE.UTF-8',
-            'Germany/Österreich': 'de_DE.UTF-8',
-            'Italy': 'it_IT.UTF-8',
-            'Spain': 'es_ES.UTF-8',
-            'Ireland/Malta': 'en_IE.UTF-8',
-            'Malta': 'mt_MT.UTF-8',
-            'France': 'fr_FR.UTF-8',
-            'Denmark': 'da_DK.UTF-8',
-            'Iceland': 'is_IS.UTF-8',
-            'Norway': 'no_NO.UTF-8',
-            'Czech Republic': 'cs_CZ.UTF-8',
-            'Poland': 'pl_PL.UTF-8',
-            'Slovakia': 'sk_SK.UTF-8',
-            'Bulgaria': 'bg_BG.UTF-8',
-            'Hungary': 'hu_HU.UTF-8',
-            'Romania': 'ro_RO.UTF-8',
-        }
-        return locale_map
-    
-    def _get_month_name(self, date: datetime, country: str, format_type: str) -> str:
-        """
-        Get the month name in the appropriate language and case for the country.
-        
-        Args:
-            date: The date object
-            country: Country name
-            format_type: The format string to determine case
-            
-        Returns:
-            Formatted month name
-        """
-        try:
-            # Set locale for the country
-            country_locale = self.locale_mapping.get(country, 'en_US.UTF-8')
-            
-            # Try to set the locale, fall back to English if not available
-            try:
-                locale.setlocale(locale.LC_TIME, country_locale)
-            except locale.Error:
-                locale.setlocale(locale.LC_TIME, 'en_US.UTF-8')
-            
-            # Determine the case based on format
-            if 'Month' in format_type:  # Capital M
-                month_name = date.strftime('%B')  # Full month name
-            elif 'MMM' in format_type:  # Three letter abbreviation
-                month_name = date.strftime('%b')  # Abbreviated month name
-            else:  # 'month' - lowercase
-                month_name = date.strftime('%B').lower()
-                
-            return month_name
-            
-        except Exception:
-            # Fallback to English month names
-            month_names = {
-                'Month': date.strftime('%B'),
-                'month': date.strftime('%B').lower(), 
-                'MMM': date.strftime('%b')
-            }
-            
-            if 'Month' in format_type:
-                return month_names['Month']
-            elif 'MMM' in format_type:
-                return month_names['MMM']
-            else:
-                return month_names['month']
-    
-    def _parse_custom_format(self, date: datetime, format_string: str, country: str) -> str:
-        """
-        Parse a custom format string and return the formatted date.
-        
-        Args:
-            date: The date to format
-            format_string: Custom format string from mapping table
-            country: Country name for locale-specific formatting
-            
-        Returns:
-            Formatted date string
-        """
-        if not format_string:
-            return ""
-            
-        result = format_string
-        
-        # Handle year formats
-        result = re.sub(r'yyyy', str(date.year), result)
-        
-        # Handle month formats (do this before day to avoid conflicts)
-        month_name = self._get_month_name(date, country, format_string)
-        result = re.sub(r'Month|month|MMM', month_name, result)
-        
-        # Handle numeric month formats
-        result = re.sub(r'mm', f"{date.month:02d}", result)
-        result = re.sub(r'MM', f"{date.month:02d}", result)
-        
-        # Handle day formats  
-        result = re.sub(r'dd', f"{date.day:02d}", result)
-        result = re.sub(r'(?<!d)d\.', f"{date.day}.", result)  # Handle single d followed by dot
-        
-        return result.strip()
-    
-    def format_date(self, date: datetime, country: str, annex_type: str) -> str:
-        """
-        Format a date according to the country's specified format for the given annex.
-        
-        Args:
-            date: The date to format
-            country: Country name (must match mapping table)
-            annex_type: Either 'annex_i' or 'annex_iiib'
-            
-        Returns:
-            Formatted date string
-            
-        Raises:
-            ValueError: If country or annex_type is not found
-        """
-        if country not in self.country_formats:
-            raise ValueError(f"Country '{country}' not found in mapping table")
-            
-        if annex_type not in ['annex_i', 'annex_iiib']:
-            raise ValueError("annex_type must be 'annex_i' or 'annex_iiib'")
-            
-        format_string = self.country_formats[country][annex_type]
-        return self._parse_custom_format(date, format_string, country)
-    
-    def get_available_countries(self) -> List[str]:
-        """Get list of available countries in the mapping table."""
-        return list(self.country_formats.keys())
-    
-    def get_country_formats(self, country: str) -> Dict[str, str]:
-        """Get both annex formats for a specific country."""
-        if country not in self.country_formats:
-            raise ValueError(f"Country '{country}' not found in mapping table")
-        return self.country_formats[country]
-    
-    def preview_format(self, country: str, sample_date: datetime = None) -> Dict[str, str]:
-        """
-        Preview how dates will be formatted for a country.
-        
-        Args:
-            country: Country name
-            sample_date: Date to use for preview (defaults to current date)
-            
-        Returns:
-            Dictionary with formatted examples for both annexes
-        """
-        if sample_date is None:
-            sample_date = datetime.now()
-            
-        try:
-            annex_i_formatted = self.format_date(sample_date, country, 'annex_i')
-            annex_iiib_formatted = self.format_date(sample_date, country, 'annex_iiib')
-            
-            return {
-                'country': country,
-                'sample_date': sample_date.strftime('%Y-%m-%d'),
-                'annex_i_format': self.country_formats[country]['annex_i'],
-                'annex_i_example': annex_i_formatted,
-                'annex_iiib_format': self.country_formats[country]['annex_iiib'],
-                'annex_iiib_example': annex_iiib_formatted
-            }
-        except Exception as e:
-            return {'error': str(e)}
-
-# Global date formatter instance
-_date_formatter: Optional[DateFormatterSystem] = None
-
-def initialize_date_formatter(mapping_file_path: str) -> DateFormatterSystem:
-    """Initialize the global date formatter."""
-    global _date_formatter
-    _date_formatter = DateFormatterSystem(mapping_file_path)
-    return _date_formatter
-
-def get_date_formatter() -> DateFormatterSystem:
-    """Get the global date formatter instance."""
-    global _date_formatter
-    if _date_formatter is None:
-        raise RuntimeError("Date formatter not initialized")
-    return _date_formatter
-
-def format_date_for_country(country: str, annex_type: str, date: Optional[datetime] = None) -> str:
-    """
-    Format a date using the enhanced DateFormatterSystem.
-    
-    Args:
-        country: Country name from mapping table
-        annex_type: Either 'annex_i' or 'annex_iiib'
-        date: Date to format (defaults to current date)
-        
-    Returns:
-        Formatted date string
-    """
-    if date is None:
-        date = datetime.now()
-    
-    try:
-        formatter = get_date_formatter()
-        return formatter.format_date(date, country, annex_type)
-    except Exception as e:
-        print(f"⚠️ Error formatting date for {country} ({annex_type}): {e}")
-        # Fallback to simple formatting
-        return date.strftime("%d %B %Y")
-
-def format_date(date_format_str: str) -> str:
-    """
-    Legacy format_date function for backward compatibility.
-    This function is deprecated - use format_date_for_country instead.
-    
-    Examples:
-    - "dd month yyyy" -> "12 August 2025"
-    - "month yyyy" -> "August 2025"
-    - "dd. MMM yyyy" -> "12. Aug 2025"
-    - "MMM yyyy" -> "Aug 2025"
-    """
-    now = datetime.now()
-    
-    # Map format patterns to strftime codes
-    if not date_format_str or date_format_str.lower() == 'nan':
-        return ""
-    
-    # Handle various date formats
-    date_format_str = date_format_str.strip()
-    
-    if date_format_str == "dd month yyyy":
-        return now.strftime("%d %B %Y")
-    elif date_format_str == "month yyyy":
-        return now.strftime("%B %Y")
-    elif date_format_str == "Month yyyy":
-        return now.strftime("%B %Y")
-    elif date_format_str == "dd. MMM yyyy":
-        return now.strftime("%d. %b %Y")
-    elif date_format_str == "MMM yyyy":
-        return now.strftime("%b %Y")
-    elif date_format_str == "dd/mm/yyyy":
-        return now.strftime("%d/%m/%Y")
-    elif date_format_str == "dd.mm.yyyy":
-        return now.strftime("%d.%m.%Y")
-    else:
-        # Default format
-        return now.strftime("%d %B %Y")
-
-# ============================================================================= 
-# CORE UTILITY FUNCTIONS
-# =============================================================================
-
-def load_mapping_table(file_path: str) -> Optional[pd.DataFrame]:
-    """Load the Excel mapping table and initialize the date formatter."""
-    try:
-        path = Path(file_path)
-        if not path.exists():
-            print(f"❌ Error: Mapping file not found: {file_path}")
-            return None
-            
-        df = pd.read_excel(path)
-        
-        # Initialize the date formatter
-        print(f"🔧 Initializing DateFormatterSystem...")
-        try:
-            initialize_date_formatter(file_path)
-            formatter = get_date_formatter()
-            available_countries = formatter.get_available_countries()
-            print(f"✅ DateFormatterSystem initialized with {len(available_countries)} countries")
-        except Exception as e:
-            print(f"❌ Error initializing DateFormatterSystem: {e}")
-            return None
-        
-        print(f"✅ Successfully loaded mapping table: {path.name}")
-        print(f"   - Rows: {len(df)}")
-        print(f"   - Columns: {len(df.columns)}")
-        
-        return df
-            
-    except Exception as e:
-        print(f"❌ Error loading Excel file: {type(e).__name__}: {str(e)}")
-        return None
-
-def get_country_code_mapping() -> Dict[str, Tuple[str, str]]:
-    """Return a mapping of two-letter codes to (language, country)."""
-    return {
-        'bg': ('Bulgarian', 'Bulgaria'), 'hr': ('Croatian', 'Croatia'),
-        'cs': ('Czech', 'Czech Republic'), 'da': ('Danish', 'Denmark'),
-        'nl': ('Dutch', 'Netherlands'), 'en': ('English', 'Ireland'),
-        'et': ('Estonian', 'Estonia'), 'fi': ('Finnish', 'Finland'),
-        'fr': ('French', 'France'), 'de': ('German', 'Germany'),
-        'el': ('Greek', 'Greece'), 'hu': ('Hungarian', 'Hungary'),
-        'is': ('Icelandic', 'Iceland'), 'it': ('Italian', 'Italy'),
-        'lv': ('Latvian', 'Latvia'), 'lt': ('Lithuanian', 'Lithuania'),
-        'mt': ('Maltese', 'Malta'), 'no': ('Norwegian', 'Norway'),
-        'pl': ('Polish', 'Poland'), 'pt': ('Portuguese', 'Portugal'),
-        'ro': ('Romanian', 'Romania'), 'sk': ('Slovak', 'Slovakia'),
-        'sl': ('Slovenian', 'Slovenia'), 'es': ('Spanish', 'Spain'),
-        'sv': ('Swedish', 'Sweden')
-    }
-
-def extract_country_code_from_filename(file_path: str) -> Optional[str]:
-    """Extract country code from filename."""
-    try:
-        filename = Path(file_path).stem
-        pattern1 = r'ema-combined-h-\d+-([a-z]{2})-annotated'
-        match = re.search(pattern1, filename, re.IGNORECASE)
-        if match:
-            return match.group(1).lower()
-        
-        pattern2 = r'ema-combined-h-\d+-([a-z]{2})[-_]'
-        match = re.search(pattern2, filename, re.IGNORECASE)
-        if match:
-            return match.group(1).lower()
-        
-        return None
-    except Exception:
-        return None
-
-def identify_document_country_and_language(file_path: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Identify both country and language from a document filename."""
-    country_code = extract_country_code_from_filename(file_path)
-    if country_code:
-        country_mapping = get_country_code_mapping()
-        if country_code in country_mapping:
-            language_name, country_name = country_mapping[country_code]
-            return country_code, language_name, country_name
-    return country_code, None, None
-
-def find_mapping_rows_for_language(mapping_df: pd.DataFrame, language_name: str) -> List[pd.Series]:
-    """Find all mapping rows for a given language."""
-    language_matches = mapping_df[mapping_df['Language'].str.lower() == language_name.lower()]
-    return [language_matches.iloc[i] for i in range(len(language_matches))]
-
-def generate_output_filename(base_name: str, language: str, country: str, doc_type: str) -> str:
-    """Generate compliant filename according to specifications."""
-    country_clean = country.replace('/', '_').replace(' ', '_')
-    
-    if doc_type == "combined":
-        return f"{base_name}_{country_clean}.docx"
-    elif doc_type == "annex_i":
-        return f"Annex_I_EU_SmPC_{language}_{country_clean}.docx"
-    elif doc_type == "annex_iiib":
-        return f"Annex_IIIB_EU_PL_{language}_{country_clean}.docx"
-    else:
-        return f"{base_name}_{doc_type}.docx"
-
+# Define utility functions that are processor-specific
 def convert_to_pdf(doc_path: str, output_dir: str) -> str:
     """Convert a Word document to PDF with multiple fallback methods and timeout protection."""
     import subprocess
-    import signal
     import time
     from pathlib import Path
-    
+
     pdf_output_path = Path(output_dir) / Path(doc_path).with_suffix(".pdf").name
     print(f"   🔄 Converting: {Path(doc_path).name} → {pdf_output_path.name}")
-    
+
     # Method 1: Try docx2pdf with timeout protection (primary method)
     print(f"   📝 Method 1: Attempting docx2pdf conversion...")
     try:
@@ -531,22 +81,22 @@ except Exception as e:
     print(f"Conversion failed: {{e}}")
     sys.exit(1)
 '''
-        
+
         result = subprocess.run([
             'python', '-c', conversion_script
         ], capture_output=True, text=True, timeout=30)  # 30-second timeout
-        
+
         if result.returncode == 0 and pdf_output_path.exists():
             print(f"   ✅ docx2pdf conversion successful")
             return str(pdf_output_path)
         else:
             print(f"   ⚠️ docx2pdf conversion failed: {result.stderr}")
-            
+
     except subprocess.TimeoutExpired:
         print(f"   ⚠️ docx2pdf conversion timed out after 30 seconds")
     except Exception as e:
         print(f"   ⚠️ docx2pdf error: {e}")
-    
+
     # Method 2: Try LibreOffice (if available)
     print(f"   🐧 Method 2: Attempting LibreOffice conversion...")
     try:
@@ -554,7 +104,7 @@ except Exception as e:
             'libreoffice', '--headless', '--convert-to', 'pdf',
             '--outdir', str(output_dir), doc_path
         ], capture_output=True, text=True, timeout=60)
-        
+
         if result.returncode == 0 and pdf_output_path.exists():
             print(f"   ✅ LibreOffice conversion successful")
             return str(pdf_output_path)
@@ -562,14 +112,14 @@ except Exception as e:
             print(f"   ⚠️ LibreOffice conversion failed: {result.stderr}")
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         print(f"   ⚠️ LibreOffice not available: {e}")
-    
+
     # Method 3: Try pandoc (if available)
     print(f"   📚 Method 3: Attempting pandoc conversion...")
     try:
         result = subprocess.run([
             'pandoc', doc_path, '-o', str(pdf_output_path)
         ], capture_output=True, text=True, timeout=30)
-        
+
         if result.returncode == 0 and pdf_output_path.exists():
             print(f"   ✅ pandoc conversion successful")
             return str(pdf_output_path)
@@ -577,7 +127,7 @@ except Exception as e:
             print(f"   ⚠️ pandoc conversion failed: {result.stderr}")
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         print(f"   ⚠️ pandoc not available: {e}")
-    
+
     # Method 4: Create a placeholder PDF (last resort)
     print(f"   📄 Method 4: Creating placeholder file...")
     try:
@@ -587,10 +137,10 @@ except Exception as e:
             f.write(f"PDF conversion failed for: {Path(doc_path).name}\n")
             f.write(f"Original document available at: {doc_path}\n")
             f.write(f"Please convert manually or install LibreOffice for automatic conversion.\n")
-        
+
         print(f"   📝 Created placeholder file: {placeholder_path.name}")
         return str(placeholder_path)
-        
+
     except Exception as e:
         print(f"   ❌ All conversion methods failed: {e}")
         raise RuntimeError(f"Failed to convert {doc_path} to PDF: All methods failed")
@@ -605,6 +155,19 @@ def copy_paragraph(dest_doc: Document, source_para: Paragraph) -> None:
         new_run.italic = run.italic
         new_run.underline = run.underline
         new_run.style = run.style
+from .hyperlinks import (
+    URLValidationResult, URLAccessibilityResult, URLValidationConfig,
+    validate_url_format, test_url_accessibility, add_hyperlink_relationship,
+    create_hyperlink_run_enhanced, create_hyperlink_element,
+    create_styled_text_fallback_element, validate_and_test_url_complete
+)
+
+# ============================================================================= 
+# CONSTANTS AND CONFIGURATION
+# =============================================================================
+
+
+
 
 # ============================================================================= 
 # DOCUMENT UPDATE FUNCTIONS
