@@ -66,31 +66,74 @@ def convert_to_pdf(doc_path: str, output_dir: str) -> str:
     """Convert a Word document to PDF with multiple fallback methods and timeout protection."""
     import subprocess
     import time
+    import gc
     from pathlib import Path
+    import sys  # Import sys to flush stdout
+
+    # Force cleanup before conversion
+    gc.collect()
 
     pdf_output_path = Path(output_dir) / Path(doc_path).with_suffix(".pdf").name
     print(f"   🔄 Converting: {Path(doc_path).name} → {pdf_output_path.name}")
+    sys.stdout.flush() # Force the log message to appear immediately
 
-    # Method 1: Try docx2pdf with timeout protection (primary method)
-    print(f"   📝 Method 1: Attempting docx2pdf conversion...")
+    # Add small delay to prevent resource conflicts
+    time.sleep(0.5)
+
+    # Method 1: Try LibreOffice (primary method)
+    print(f"   🐧 Method 1: Attempting LibreOffice conversion...")
+    sys.stdout.flush()
+    try:
+        # Redirect stdout to DEVNULL to prevent worker deadlocks.
+        # Capture stderr (PIPE) to see potential errors from LibreOffice.
+        result = subprocess.run(
+            [
+                'libreoffice', '--headless', '--convert-to', 'pdf',
+                '--outdir', str(output_dir), doc_path
+            ],
+            timeout=60,
+            stdout=subprocess.DEVNULL, # Discard standard output
+            stderr=subprocess.PIPE,     # Capture standard error
+            text=True                   # Decode stderr as text
+        )
+
+        if result.returncode == 0 and pdf_output_path.exists():
+            print(f"   ✅ LibreOffice conversion successful")
+            return str(pdf_output_path)
+        else:
+            # Provide more detailed error logging from LibreOffice's stderr
+            error_message = result.stderr if result.stderr else "No error message from LibreOffice."
+            print(f"   ⚠️ LibreOffice conversion failed (Code: {result.returncode}): {error_message}")
+            # Raise an exception to trigger fallback methods
+            raise RuntimeError(f"LibreOffice failed with code {result.returncode}")
+
+    except subprocess.TimeoutExpired:
+        print(f"   ⚠️ LibreOffice conversion timed out after 60 seconds")
+    except FileNotFoundError:
+        print(f"   ⚠️ LibreOffice command not found. Ensure it is installed and in your system's PATH.")
+    except Exception as e:
+        print(f"   ⚠️ An unexpected error occurred with LibreOffice: {e}")
+
+    # Method 2: Try docx2pdf with timeout protection (fallback method)
+    print(f"   📝 Method 2: Attempting docx2pdf conversion...")
+    sys.stdout.flush()
     try:
         # Use subprocess to run docx2pdf with timeout control
         conversion_script = f'''
-import sys
-from docx2pdf import convert
-import time
-start_time = time.time()
-try:
-    convert("{doc_path}", "{pdf_output_path}")
-    print(f"Conversion completed in {{time.time() - start_time:.2f}} seconds")
-except Exception as e:
-    print(f"Conversion failed: {{e}}")
-    sys.exit(1)
-'''
-
+        import sys
+        from docx2pdf import convert
+        import time
+        start_time = time.time()
+        try:
+            convert(r"{doc_path}", r"{pdf_output_path}")
+            print(f"Conversion completed in {{time.time() - start_time:.2f}} seconds")
+        except Exception as e:
+            print(f"Conversion failed: {{e}}")
+            sys.exit(1)
+            '''
         result = subprocess.run([
             'python', '-c', conversion_script
-        ], capture_output=True, text=True, timeout=30)  # 30-second timeout
+        ], capture_output=True, text=True, timeout=15)
 
         if result.returncode == 0 and pdf_output_path.exists():
             print(f"   ✅ docx2pdf conversion successful")
@@ -99,25 +142,13 @@ except Exception as e:
             print(f"   ⚠️ docx2pdf conversion failed: {result.stderr}")
 
     except subprocess.TimeoutExpired:
-        print(f"   ⚠️ docx2pdf conversion timed out after 30 seconds")
+        print(f"   ⚠️ docx2pdf conversion timed out after 15 seconds")
     except Exception as e:
         print(f"   ⚠️ docx2pdf error: {e}")
 
-    # Method 2: Try LibreOffice (if available)
-    print(f"   🐧 Method 2: Attempting LibreOffice conversion...")
-    try:
-        result = subprocess.run([
-            'libreoffice', '--headless', '--convert-to', 'pdf',
-            '--outdir', str(output_dir), doc_path
-        ], capture_output=True, text=True, timeout=60)
-
-        if result.returncode == 0 and pdf_output_path.exists():
-            print(f"   ✅ LibreOffice conversion successful")
-            return str(pdf_output_path)
-        else:
-            print(f"   ⚠️ LibreOffice conversion failed: {result.stderr}")
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        print(f"   ⚠️ LibreOffice not available: {e}")
+    # Clean up after failed conversion attempt
+    gc.collect()
+    time.sleep(0.5)
 
     # Method 3: Try pandoc (if available)
     print(f"   📚 Method 3: Attempting pandoc conversion...")
@@ -142,7 +173,7 @@ except Exception as e:
         with open(placeholder_path, 'w') as f:
             f.write(f"PDF conversion failed for: {Path(doc_path).name}\n")
             f.write(f"Original document available at: {doc_path}\n")
-            f.write(f"Please convert manually or install LibreOffice for automatic conversion.\n")
+            f.write(f"Please convert manually or install another conversion tool.\n")
 
         print(f"   📝 Created placeholder file: {placeholder_path.name}")
         return str(placeholder_path)
