@@ -16,10 +16,18 @@ from .date_formatter import (
 )
 
 from .file_manager import (
-    load_mapping_table, get_country_code_mapping, 
+    load_mapping_table, get_country_code_mapping,
     extract_country_code_from_filename, identify_document_country_and_language,
     find_mapping_rows_for_language, generate_output_filename, convert_to_pdf
 )
+
+from .mapping_table import (
+    MappingRow,
+    MappingTable,
+    REQUIRED_COLUMNS,
+    FILENAME_PATTERN_COLUMNS,
+)
+from .default_mapping import load_default_mapping_dataframe
 
 from .document_utils import (
     copy_paragraph, is_hex_gray_color, is_run_gray_shaded, is_run_hyperlink,
@@ -50,9 +58,11 @@ __all__ = [
     'get_date_formatter', 'format_date_for_country',
     
     # File management
-    'load_mapping_table', 'get_country_code_mapping', 
+    'load_mapping_table', 'get_country_code_mapping',
     'extract_country_code_from_filename', 'identify_document_country_and_language',
     'find_mapping_rows_for_language', 'generate_output_filename', 'convert_to_pdf',
+    'MappingRow', 'MappingTable', 'REQUIRED_COLUMNS', 'FILENAME_PATTERN_COLUMNS',
+    'load_default_mapping_dataframe',
     
     # Document utilities
     'copy_paragraph', 'is_hex_gray_color', 'is_run_gray_shaded', 'is_run_hyperlink',

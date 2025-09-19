@@ -3,7 +3,9 @@
 import locale
 import re
 from datetime import datetime
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Union
+
 import pandas as pd
 
 
@@ -13,14 +15,17 @@ class DateFormatterSystem:
     Supports locale-specific month names and custom static text.
     """
 
-    def __init__(self, mapping_file_path: str):
+    def __init__(self, mapping_source: Union[str, Path, pd.DataFrame]):
         """
         Initialize the date formatter with a mapping file.
 
         Args:
-            mapping_file_path: Path to the Excel mapping file
+            mapping_source: Path to the Excel mapping file or a dataframe instance
         """
-        self.mapping_df = pd.read_excel(mapping_file_path)
+        if isinstance(mapping_source, (str, Path)):
+            self.mapping_df = pd.read_excel(mapping_source)
+        else:
+            self.mapping_df = mapping_source.copy()
         self.country_formats = self._load_country_formats()
         self.locale_mapping = self._create_locale_mapping()
         
@@ -239,10 +244,12 @@ class DateFormatterSystem:
 _date_formatter: Optional[DateFormatterSystem] = None
 
 
-def initialize_date_formatter(mapping_file_path: str) -> DateFormatterSystem:
+def initialize_date_formatter(
+    mapping_source: Union[str, Path, pd.DataFrame]
+) -> DateFormatterSystem:
     """Initialize the global date formatter."""
     global _date_formatter
-    _date_formatter = DateFormatterSystem(mapping_file_path)
+    _date_formatter = DateFormatterSystem(mapping_source)
     return _date_formatter
 
 
