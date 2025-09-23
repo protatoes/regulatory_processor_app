@@ -35,6 +35,7 @@ from docx.shared import RGBColor
 from docx.oxml import parse_xml
 from docx.oxml.ns import nsdecls, qn
 from docx.oxml import OxmlElement
+from regulatory_processor.document_splitter import clone_and_split_document
 from docx2pdf import convert
 
 # Import refactored modules
@@ -780,25 +781,44 @@ def find_target_text_range(para: Paragraph, target_string: str) -> Tuple[int, in
 
 
 def find_runs_to_remove(para: Paragraph, target_string: str) -> List[Run]:
-    """Find runs that should be removed - ONLY the gray shaded target text from mapping.
+    """Find runs that should be removed - Enhanced with XML-based hyperlink handling.
 
-    Conservative approach: Only remove runs that contain the exact target text
-    from 'Original text national reporting - SmPC' column AND are gray shaded or hyperlinked.
+    This function now uses XML-based removal for complex cases (like invisible hyperlinks)
+    and falls back to the original run-based approach if needed.
     """
-    runs_to_remove = []
-
     if not target_string.strip():
-        return runs_to_remove
+        return []
 
-    print(f"\n🎯 CONSERVATIVE TEXT REMOVAL")
-    print(f"Looking for exact target: '{target_string}'")
+    print(f"\n🎯 ENHANCED TEXT REMOVAL")
+    print(f"Target: '{target_string}'")
     print(f"Paragraph text: '{para.text}'")
 
-    # Only look for the exact target text
+    # Check if we have a runs vs text mismatch (indicates invisible hyperlinks)
+    para_text_len = len(para.text)
+    runs_text_len = sum(len(run.text) for run in para.runs)
+    has_invisible_content = para_text_len != runs_text_len
+
+    if has_invisible_content:
+        print(f"🔍 Detected invisible content (text: {para_text_len}, runs: {runs_text_len} chars)")
+        print(f"🎯 Using XML-based removal for hyperlink handling...")
+
+        # Use XML-based removal for invisible content
+        success = _remove_target_text_xml_internal(para, target_string)
+        if success:
+            print(f"✅ XML-based removal completed")
+            return []  # Return empty list since removal was done directly
+        else:
+            print(f"⚠️  XML removal failed, falling back to run-based approach")
+
+    # Original run-based approach (fallback or primary for simple cases)
+    print(f"🎯 Using run-based removal...")
+    runs_to_remove = []
+
+    # Find target text range
     target_start, target_end = find_target_text_range(para, target_string)
 
     if target_start == -1:
-        print(f"❌ Target text not found in paragraph - nothing to remove")
+        print(f"❌ Target text not found")
         return runs_to_remove
 
     print(f"✅ Target found at position {target_start}-{target_end}")
@@ -813,11 +833,9 @@ def find_runs_to_remove(para: Paragraph, target_string: str) -> List[Run]:
         run_ranges.append((run, run_start, run_end))
         char_pos = run_end
 
-    # Only remove runs that overlap with the target text AND are styled (gray/hyperlink)
+    # Find runs that overlap with target text and are styled
     for i, (run, run_start, run_end) in enumerate(run_ranges):
-        # Check if run overlaps with target range
         if run_start < target_end and run_end > target_start:
-            # Only remove if it's actually gray shaded or a hyperlink
             is_gray = is_run_gray_shaded(run)
             is_hyperlink = is_run_hyperlink(run)
 
@@ -833,8 +851,99 @@ def find_runs_to_remove(para: Paragraph, target_string: str) -> List[Run]:
         else:
             print(f"  ⏭️  KEEPING Run {i}: '{run.text}' - outside target range")
 
-    print(f"\n🗑️  Will remove {len(runs_to_remove)} runs out of {len(run_ranges)} total")
+    print(f"🗑️  Will remove {len(runs_to_remove)} runs out of {len(run_ranges)} total")
     return runs_to_remove
+
+
+def _remove_target_text_xml_internal(paragraph: Paragraph, target_string: str) -> bool:
+    """
+    Internal XML-based text removal for invisible hyperlinks.
+
+    This handles cases where hyperlink runs are not exposed in paragraph.runs.
+    """
+    p_element = paragraph._element
+    w_namespace = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+
+    try:
+        # Extract text from XML
+        try:
+            all_text_nodes = p_element.xpath('.//w:t/text()', namespaces={'w': w_namespace})
+            full_text = "".join(all_text_nodes)
+        except:
+            text_elements = p_element.findall(f'.//{{{w_namespace}}}t')
+            full_text = "".join(t.text or '' for t in text_elements)
+
+        # Handle text duplication (corrupted docs)
+        if len(full_text) > 0 and full_text == (full_text[:len(full_text)//2] * 2):
+            full_text = full_text[:len(full_text)//2]
+            print(f"📝 Cleaned duplicated text")
+
+        # Find target position
+        target_start = full_text.lower().find(target_string.lower())
+        if target_start == -1:
+            return False
+
+        target_end = target_start + len(target_string)
+
+        # Get all XML runs
+        try:
+            all_runs = p_element.xpath('.//w:r', namespaces={'w': w_namespace})
+        except:
+            all_runs = p_element.findall(f'.//{{{w_namespace}}}r')
+
+        print(f"🔍 Processing {len(all_runs)} XML runs...")
+
+        # Process runs and mark for deletion/modification
+        current_pos = 0
+        runs_to_delete = []
+        runs_to_modify = []
+
+        for run_element in all_runs:
+            try:
+                text_elements = run_element.xpath('./w:t', namespaces={'w': w_namespace})
+            except:
+                text_elements = run_element.findall(f'{{{w_namespace}}}t')
+
+            run_text = "".join(t.text or '' for t in text_elements)
+            if len(run_text) > 0 and run_text == (run_text[:len(run_text)//2] * 2):
+                run_text = run_text[:len(run_text)//2]
+
+            run_start = current_pos
+            run_end = current_pos + len(run_text)
+
+            # Check overlap with target
+            if run_start < target_end and run_end > target_start:
+                if run_start >= target_start and run_end <= target_end:
+                    runs_to_delete.append(run_element)
+                else:
+                    runs_to_modify.append((run_element, text_elements))
+
+            current_pos = run_end
+
+        # Execute deletions
+        for run_element in runs_to_delete:
+            # Check if run is inside a hyperlink
+            hyperlink_parent = run_element.getparent()
+            while hyperlink_parent is not None:
+                if hyperlink_parent.tag.endswith('hyperlink'):
+                    hyperlink_parent.getparent().remove(hyperlink_parent)
+                    break
+                hyperlink_parent = hyperlink_parent.getparent()
+            else:
+                parent = run_element.getparent()
+                if parent is not None:
+                    parent.remove(run_element)
+
+        # Execute modifications
+        for run_element, text_elements in runs_to_modify:
+            for t in text_elements:
+                t.text = ""
+
+        return True
+
+    except Exception as e:
+        print(f"❌ XML removal error: {e}")
+        return False
 
 
 def find_gray_and_hyperlink_runs(para: Paragraph, target_string: str) -> List[Run]:
@@ -1518,11 +1627,11 @@ def run_annex_update_v2(doc: Document, mapping_row: pd.Series, section_type: str
     for para in doc.paragraphs:
         if target_string.lower() in para.text.lower():
             
-            # Find runs to remove - only gray shaded target text
+            # Find runs to remove - enhanced with XML-based hyperlink handling
             runs_to_remove = find_runs_to_remove(para, target_string)
 
             if runs_to_remove:
-                # Remove only the identified runs (conservative approach)
+                # Remove only the identified runs (traditional approach)
                 print(f"Removing {len(runs_to_remove)} specific runs...")
                 for run in runs_to_remove:
                     try:
@@ -1535,7 +1644,12 @@ def run_annex_update_v2(doc: Document, mapping_row: pd.Series, section_type: str
                 remaining_text = para.text.strip()
                 print(f"Text after removal: '{remaining_text}'")
             else:
-                print(f"No runs to remove - proceeding with insertion")
+                # Empty list could mean XML removal was already done, or no runs to remove
+                remaining_text = para.text.strip()
+                if target_string.lower() in remaining_text.lower():
+                    print(f"Target still present - XML removal may have failed")
+                else:
+                    print(f"XML-based removal completed - proceeding with insertion")
 
             # Insert formatted replacement at the end of the paragraph (ALWAYS after removal)
             try:
@@ -1898,8 +2012,52 @@ def update_local_representatives(doc: Document, mapping_row: pd.Series) -> bool:
 # =============================================================================
 
 def split_annexes(source_path: str, output_dir: str, language: str, country: str, mapping_row: pd.Series) -> Tuple[str, str]:
-    """Split a combined SmPC document into Annex I and Annex IIIB documents."""
-    return split_annexes_three_headers_with_fallback(source_path, output_dir, language, country, mapping_row)
+    """
+    Split a combined SmPC document into Annex I and Annex IIIB documents.
+
+    ENHANCED VERSION: Uses clone-and-prune approach for perfect document preservation.
+    This preserves ALL formatting, hyperlinks, headers, footers, and scaffolding.
+    """
+    print("🚀 Using enhanced clone-and-prune document splitting")
+
+    try:
+        # Get actual headers from mapping file (what's really in the document)
+        annex_i_header = str(mapping_row.get('Annex I Header in country language', 'ANNEX I')).strip()
+        annex_iiib_header = str(mapping_row.get('Annex IIIB Header in country language', 'ANNEX III')).strip()
+
+        print(f"📋 Using headers from mapping file:")
+        print(f"   Annex I: '{annex_i_header}'")
+        print(f"   Annex IIIB: '{annex_iiib_header}'")
+
+        # Use clone-and-prune approach with actual document headers
+        result_paths = clone_and_split_document(
+            source_path=source_path,
+            output_dir=output_dir,
+            country_code=country,
+            target_annexes=[annex_i_header, annex_iiib_header],  # Use actual headers from mapping
+            language=language,
+            mapping_row=mapping_row
+        )
+
+        # Extract paths for return (maintain backward compatibility)
+        # Map back to expected keys
+        annex_i_path = result_paths.get(annex_i_header)
+        annex_iiib_path = result_paths.get(annex_iiib_header)
+
+        if not annex_i_path or not annex_iiib_path:
+            print("⚠️ Clone-and-prune failed, falling back to original method")
+            return split_annexes_three_headers_with_fallback(source_path, output_dir, language, country, mapping_row)
+
+        print(f"✅ Successfully split documents using clone-and-prune:")
+        print(f"   ANNEX I: {annex_i_path}")
+        print(f"   ANNEX IIIB: {annex_iiib_path}")
+
+        return annex_i_path, annex_iiib_path
+
+    except Exception as e:
+        print(f"⚠️ Clone-and-prune error: {e}")
+        print("🔄 Falling back to original splitting method...")
+        return split_annexes_three_headers_with_fallback(source_path, output_dir, language, country, mapping_row)
 
 def split_annexes_enhanced(source_path: str, output_dir: str, language: str, country: str, mapping_row: pd.Series) -> Tuple[str, str]:
     """

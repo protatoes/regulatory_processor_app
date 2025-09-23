@@ -151,7 +151,7 @@ def index() -> rx.Component:
                 border="1px solid #ddd",
                 border_radius="md",
                 width="100%",
-                bg="#f9f9f9",
+                bg="#461010",
             ),
             width="600px",
             align="start",
