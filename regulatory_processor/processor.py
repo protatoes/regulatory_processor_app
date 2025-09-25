@@ -35,7 +35,14 @@ from docx.shared import RGBColor
 from docx.oxml import parse_xml
 from docx.oxml.ns import nsdecls, qn
 from docx.oxml import OxmlElement
-from regulatory_processor.document_splitter import clone_and_split_document
+from regulatory_processor.document_splitter import (
+    clone_and_split_document,
+    copy_paragraph, copy_table, _copy_paragraph_content,
+    copy_document_structure, copy_headers_and_footers, copy_styles,
+    copy_paragraph_safe, copy_table_safe, copy_document_settings_safe,
+    copy_document_properties, get_document_elements_in_order,
+    extract_section_safe_copy, extract_section_xml
+)
 from docx2pdf import convert
 
 # Import refactored modules
@@ -183,180 +190,16 @@ def convert_to_pdf(doc_path: str, output_dir: str) -> str:
         print(f"   ❌ All conversion methods failed: {e}")
         raise RuntimeError(f"Failed to convert {doc_path} to PDF: All methods failed")
 
-def copy_paragraph(dest_doc: Document, source_para: Paragraph) -> None:
-    """Copy a paragraph from one document to another, preserving comprehensive formatting."""
-    new_para = dest_doc.add_paragraph()
-
-    # Copy paragraph-level formatting
-    new_para.style = source_para.style
-
-    # Copy paragraph format properties
-    if source_para.paragraph_format:
-        pf_source = source_para.paragraph_format
-        pf_dest = new_para.paragraph_format
-
-        # Copy alignment
-        if pf_source.alignment is not None:
-            pf_dest.alignment = pf_source.alignment
-
-        # Copy spacing
-        if pf_source.space_before is not None:
-            pf_dest.space_before = pf_source.space_before
-        if pf_source.space_after is not None:
-            pf_dest.space_after = pf_source.space_after
-        if pf_source.line_spacing is not None:
-            pf_dest.line_spacing = pf_source.line_spacing
-
-        # Copy indentation
-        if pf_source.left_indent is not None:
-            pf_dest.left_indent = pf_source.left_indent
-        if pf_source.right_indent is not None:
-            pf_dest.right_indent = pf_source.right_indent
-        if pf_source.first_line_indent is not None:
-            pf_dest.first_line_indent = pf_source.first_line_indent
-
-    # Copy all runs with comprehensive formatting
-    for run in source_para.runs:
-        new_run = new_para.add_run(run.text)
-
-        # Copy basic formatting
-        new_run.bold = run.bold
-        new_run.italic = run.italic
-        new_run.underline = run.underline
-        new_run.style = run.style
-
-        # Copy font properties
-        if run.font:
-            if run.font.name:
-                new_run.font.name = run.font.name
-            if run.font.size:
-                new_run.font.size = run.font.size
-            if run.font.color.rgb:
-                new_run.font.color.rgb = run.font.color.rgb
-            if run.font.highlight_color:
-                new_run.font.highlight_color = run.font.highlight_color
+# copy_paragraph function moved to document_splitter.py
 
 
-def copy_table(dest_doc: Document, source_table) -> None:
-    """Copy a table from source document to destination document, preserving formatting."""
-    # Get table dimensions
-    rows = len(source_table.rows)
-    cols = len(source_table.columns) if source_table.rows else 0
-
-    if rows == 0 or cols == 0:
-        return
-
-    # Create new table
-    new_table = dest_doc.add_table(rows=rows, cols=cols)
-
-    # Copy table style if available
-    if hasattr(source_table, 'style') and source_table.style:
-        new_table.style = source_table.style
-
-    # Copy cell content and formatting
-    for row_idx, source_row in enumerate(source_table.rows):
-        dest_row = new_table.rows[row_idx]
-
-        for col_idx, source_cell in enumerate(source_row.cells):
-            dest_cell = dest_row.cells[col_idx]
-
-            # Clear default paragraph in destination cell
-            dest_cell.text = ""
-            if dest_cell.paragraphs:
-                dest_cell.paragraphs[0].clear()
-
-            # Copy all paragraphs from source cell
-            for para_idx, source_para in enumerate(source_cell.paragraphs):
-                if para_idx == 0 and dest_cell.paragraphs:
-                    # Use existing first paragraph
-                    dest_para = dest_cell.paragraphs[0]
-                    # Copy paragraph content manually
-                    _copy_paragraph_content(dest_para, source_para)
-                else:
-                    # Add new paragraph
-                    dest_para = dest_cell.add_paragraph()
-                    _copy_paragraph_content(dest_para, source_para)
+# copy_table function moved to document_splitter.py
 
 
-def _copy_paragraph_content(dest_para, source_para) -> None:
-    """Helper function to copy paragraph content without creating a new paragraph."""
-    # Copy paragraph-level formatting
-    dest_para.style = source_para.style
-
-    # Copy paragraph format properties
-    if source_para.paragraph_format:
-        pf_source = source_para.paragraph_format
-        pf_dest = dest_para.paragraph_format
-
-        if pf_source.alignment is not None:
-            pf_dest.alignment = pf_source.alignment
-        if pf_source.space_before is not None:
-            pf_dest.space_before = pf_source.space_before
-        if pf_source.space_after is not None:
-            pf_dest.space_after = pf_source.space_after
-        if pf_source.line_spacing is not None:
-            pf_dest.line_spacing = pf_source.line_spacing
-        if pf_source.left_indent is not None:
-            pf_dest.left_indent = pf_source.left_indent
-        if pf_source.right_indent is not None:
-            pf_dest.right_indent = pf_source.right_indent
-        if pf_source.first_line_indent is not None:
-            pf_dest.first_line_indent = pf_source.first_line_indent
-
-    # Copy all runs
-    for run in source_para.runs:
-        new_run = dest_para.add_run(run.text)
-
-        # Copy formatting
-        new_run.bold = run.bold
-        new_run.italic = run.italic
-        new_run.underline = run.underline
-        new_run.style = run.style
-
-        if run.font:
-            if run.font.name:
-                new_run.font.name = run.font.name
-            if run.font.size:
-                new_run.font.size = run.font.size
-            if run.font.color.rgb:
-                new_run.font.color.rgb = run.font.color.rgb
-            if run.font.highlight_color:
-                new_run.font.highlight_color = run.font.highlight_color
+# _copy_paragraph_content function moved to document_splitter.py
 
 
-def copy_document_structure(source_doc: Document, dest_doc: Document) -> None:
-    """Copy document structure elements like headers, footers, and page setup."""
-
-    try:
-        # Copy document properties
-        if hasattr(source_doc.core_properties, 'title') and source_doc.core_properties.title:
-            dest_doc.core_properties.title = source_doc.core_properties.title
-        if hasattr(source_doc.core_properties, 'author') and source_doc.core_properties.author:
-            dest_doc.core_properties.author = source_doc.core_properties.author
-        if hasattr(source_doc.core_properties, 'subject') and source_doc.core_properties.subject:
-            dest_doc.core_properties.subject = source_doc.core_properties.subject
-    except Exception as e:
-        print(f"⚠️ Could not copy document properties: {e}")
-
-    try:
-        # Copy page setup from first section
-        if source_doc.sections and dest_doc.sections:
-            source_section = source_doc.sections[0]
-            dest_section = dest_doc.sections[0]
-
-            # Copy page dimensions and margins
-            dest_section.page_height = source_section.page_height
-            dest_section.page_width = source_section.page_width
-            dest_section.left_margin = source_section.left_margin
-            dest_section.right_margin = source_section.right_margin
-            dest_section.top_margin = source_section.top_margin
-            dest_section.bottom_margin = source_section.bottom_margin
-            dest_section.gutter = source_section.gutter
-
-            # Copy orientation
-            dest_section.orientation = source_section.orientation
-    except Exception as e:
-        print(f"⚠️ Could not copy page setup: {e}")
+# copy_document_structure function moved to document_splitter.py
 
 
 def copy_headers_and_footers(source_doc: Document, dest_doc: Document) -> None:

@@ -33,17 +33,15 @@ def get_country_code_mapping() -> Dict[str, Tuple[str, str]]:
     }
 
 
+
 def extract_country_code_from_filename(file_path: str) -> Optional[str]:
     """Extract country code from filename."""
     try:
         filename = Path(file_path).stem
-        pattern1 = r'ema-combined-h-\d+-([a-z]{2})-annotated'
-        match = re.search(pattern1, filename, re.IGNORECASE)
-        if match:
-            return match.group(1).lower()
-
-        pattern2 = r'ema-combined-h-\d+-([a-z]{2})[-_]'
-        match = re.search(pattern2, filename, re.IGNORECASE)
+        
+        # Single pattern to capture country code after the base structure
+        pattern = r'ema-combined-h-\d+-([a-z]{2})'
+        match = re.search(pattern, filename, re.IGNORECASE)
         if match:
             return match.group(1).lower()
 
