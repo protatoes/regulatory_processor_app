@@ -1685,72 +1685,106 @@ def update_annex_iiib_date(doc: Document, mapping_row: pd.Series, mapping_file_p
 def filter_local_representatives(doc: Document, mapping_row: pd.Series) -> bool:
     """
     Filter local representatives in Section 6 of Annex IIIB to keep only applicable ones.
-    
-    This function implements the manual process requirement to "Keep only applicable 
-    local rep(s) for each language file" as specified in Section 6 of the manual process.
-    
-    The function identifies the local representative section and removes all local reps
-    except those applicable to the current country/language, then applies bold formatting
-    to country names as specified.
-    
+
+    Enhanced to support both table-based and paragraph-based local rep processing.
+    First attempts table processing (modern approach), then falls back to paragraph
+    processing (legacy compatibility).
+
     Args:
         doc: Document object to modify
         mapping_row: Row from mapping file containing local rep filtering data
-    
+
     Returns:
         bool: True if local representatives were successfully filtered
+    """
+    country = str(mapping_row.get('Country', '')).strip()
+
+    print(f"🔧 DEBUG: filter_local_representatives called")
+    print(f"   Country extracted: '{country}'")
+
+    if not country:
+        print("❌ DEBUG: No country found, returning False")
+        return False
+
+    # Try table-based processing first (new capability)
+    print("🔧 DEBUG: Attempting table-based processing...")
+    try:
+        from .local_rep_table_processor import LocalRepTableProcessor
+
+        table_processor = LocalRepTableProcessor()
+        table_result = table_processor.process_local_rep_table(doc, mapping_row)
+        print(f"🔧 DEBUG: Table processing result: {table_result}")
+
+        if table_result:
+            print("✅ Local representatives processed using table-based approach")
+            return True
+        else:
+            print("⚠️  Table processing returned False, trying paragraph fallback...")
+
+    except Exception as e:
+        print(f"⚠️  Table processing failed with exception, falling back to paragraph processing: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # Fallback to existing paragraph processing (preserved for compatibility)
+    print("🔧 DEBUG: Attempting paragraph-based processing...")
+    paragraph_result = _filter_local_representatives_paragraphs(doc, mapping_row)
+    print(f"🔧 DEBUG: Paragraph processing result: {paragraph_result}")
+    return paragraph_result
+
+
+def _filter_local_representatives_paragraphs(doc: Document, mapping_row: pd.Series) -> bool:
+    """
+    Legacy paragraph-based local representative filtering.
+
+    Preserved for backward compatibility and documents that don't use table format.
     """
     # Get applicable local representatives for this language/country
     applicable_reps = str(mapping_row.get('Local Representative', '')).strip()
     country = str(mapping_row.get('Country', '')).strip()
     language = str(mapping_row.get('Language', '')).strip()
-    
+
     if not applicable_reps or applicable_reps.lower() == 'nan':
         return False
-    
     # Parse countries that should be bold formatted
     bold_countries_str = str(mapping_row.get('Country names to be bolded - Local Reps', '')).strip()
-    bold_countries = [c.strip() for c in bold_countries_str.split(',') 
+    bold_countries = [c.strip() for c in bold_countries_str.split(',')
                      if c.strip() and c.strip().lower() != 'nan']
-    
+
     found = False
     in_section_6 = False
     in_local_rep_section = False
-    local_rep_start_idx = None
     paragraphs_to_remove = []
-    local_rep_header_para = None
-    
+
     # Phase 1: Identify Section 6 and locate local representative paragraphs
     for idx, para in enumerate(doc.paragraphs):
         text_lower = para.text.lower()
-        
+
         # Check if we're entering Section 6
         if ('6.' in text_lower and 'contents of the pack' in text_lower) or \
            ('section 6' in text_lower) or \
            ('contenu de l\'emballage' in text_lower):
             in_section_6 = True
             continue
-        
+
         # Check if we've left Section 6 (entering next section)
         if in_section_6 and _is_section_header(para.text):
             break
-            
+
         # Look for local representative section header
         if in_section_6 and ('local representative' in text_lower or 'représentant local' in text_lower):
             in_local_rep_section = True
-            local_rep_header_para = para
-            local_rep_start_idx = idx
             continue
-            
+
         # Collect local rep entries to potentially remove
         if in_local_rep_section:
             # Stop if we hit marketing auth holder or other major section
-            if ('marketing authorisation holder' in text_lower or 
+            if ('marketing authorisation holder' in text_lower or
                 'manufacturing authorisation holder' in text_lower or
                 'this leaflet was last revised' in text_lower or
                 _is_section_header(para.text)):
                 break
-                
+
             # Check if this paragraph contains a local rep entry
             if _contains_country_local_rep_entry(para.text):
                 # Determine if this local rep should be kept or removed
@@ -1760,7 +1794,7 @@ def filter_local_representatives(doc: Document, mapping_row: pd.Series) -> bool:
                     # This is the applicable local rep - apply bold formatting
                     _apply_bold_formatting_to_paragraph(para, bold_countries)
                     found = True
-    
+
     # Phase 2: Remove non-applicable local representative paragraphs
     # Remove in reverse order to maintain correct indices
     for idx in reversed(paragraphs_to_remove):
@@ -1768,7 +1802,7 @@ def filter_local_representatives(doc: Document, mapping_row: pd.Series) -> bool:
         para_to_remove = doc.paragraphs[idx]
         # Remove the paragraph's content
         para_to_remove.clear()
-        
+
     return found
 
 
@@ -1838,6 +1872,38 @@ def _is_section_header(text: str) -> bool:
     # Look for patterns like "7.", "section 7", etc.
     import re
     return bool(re.match(r'^\s*\d+\.', text) or re.match(r'^\s*section\s+\d+', text_lower))
+
+
+def update_local_representatives(doc: Document, mapping_row: pd.Series) -> bool:
+    """
+    Update local representatives - wrapper function with debug logging.
+
+    This function is called by the main processing workflow and delegates to
+    the enhanced filter_local_representatives function.
+    """
+    country = mapping_row.get('Country', 'MISSING')
+    language = mapping_row.get('Language', 'MISSING')
+    local_rep_data = mapping_row.get('Local Representative', 'MISSING')
+
+    print(f"🔧 DEBUG: Starting local rep processing")
+    print(f"   Country: {country}")
+    print(f"   Language: {language}")
+    print(f"   Local Rep Data: {local_rep_data[:100] if isinstance(local_rep_data, str) else local_rep_data}")
+    print(f"   Document has {len(doc.tables)} tables")
+
+    try:
+        result = filter_local_representatives(doc, mapping_row)
+        print(f"🔧 DEBUG: Local rep processing result: {result}")
+        if result:
+            print("✅ Local rep processing succeeded!")
+        else:
+            print("❌ Local rep processing returned False")
+        return result
+    except Exception as e:
+        print(f"💥 DEBUG: Local rep processing failed with exception: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 
 
