@@ -284,6 +284,58 @@ class LocalRepTableProcessor:
 
         return first_word_clean == target_country
 
+    def _cleanup_empty_rows(self, table: Table) -> int:
+        """
+        Remove empty rows after filtering to clean up table formatting.
+
+        Strategy:
+        1. Iterate through table rows in reverse order (to maintain indices)
+        2. Check if all cells in row are empty (no text content)
+        3. Remove empty rows, but keep the first empty row for spacing
+        4. Log cleanup operations for debugging
+
+        Args:
+            table: Table to clean up
+
+        Returns:
+            int: Number of rows removed
+        """
+        rows_to_remove = []
+        first_empty_row_found = False
+
+        print(f"🔧 DEBUG: Starting empty row cleanup on table with {len(table.rows)} rows")
+
+        # Identify empty rows (iterate forward to find first empty row)
+        for i, row in enumerate(table.rows):
+            all_cells_empty = True
+
+            for cell in row.cells:
+                if cell.text.strip():  # If any cell has content
+                    all_cells_empty = False
+                    break
+
+            if all_cells_empty:
+                if first_empty_row_found:
+                    # This is not the first empty row, mark for removal
+                    rows_to_remove.append(i)
+                    print(f"🗑️  DEBUG: Marking empty row {i} for removal")
+                else:
+                    # This is the first empty row, keep it for formatting
+                    first_empty_row_found = True
+                    print(f"✅ DEBUG: Keeping first empty row {i} for formatting")
+
+        # Remove rows in reverse order to maintain indices
+        for row_index in reversed(rows_to_remove):
+            try:
+                row_element = table.rows[row_index]._element
+                row_element.getparent().remove(row_element)
+                print(f"🔗 DEBUG: Removed empty row {row_index}")
+            except Exception as e:
+                print(f"⚠️  Warning: Could not remove row {row_index} - {e}")
+
+        print(f"🔧 DEBUG: Empty row cleanup completed. {len(rows_to_remove)} rows removed")
+        return len(rows_to_remove)
+
 
 def process_local_rep_table_standalone(doc: Document, target_country: str) -> bool:
     """
