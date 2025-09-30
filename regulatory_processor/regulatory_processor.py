@@ -10,6 +10,8 @@ documents. Progress is reported via a status field on the page.
 """
 
 import os
+import asyncio
+from functools import partial
 import reflex as rx
 
 # Import the processor module and its necessary classes
@@ -64,21 +66,37 @@ class AppState(rx.State):
     async def run_processing_background(self) -> None:
         """
         Runs the heavy document processing logic in the background.
-        This function does not block the main app thread.
+        This function does not block the main app thread and yields control
+        to the Reflex event loop using asyncio.run_in_executor.
         """
         # Use 'async with self' to get a clean instance of the state
         async with self:
             folder = os.path.expanduser(self.folder_path.strip())
             mapping = os.path.expanduser(self.mapping_path.strip())
 
+        # Update status to show we're starting
+        async with self:
+            self.status = "Initializing document processing..."
+
         try:
-            # This is the long-running, blocking call.
+            # Create processing configuration
             config = processor.ProcessingConfig(
                 create_backups=True,
                 convert_to_pdf=True,
                 log_level="INFO"
             )
-            result = processor.process_folder_enhanced(folder, mapping, config)
+
+            # Update status before starting main processing
+            async with self:
+                self.status = "Processing documents (this may take several minutes)..."
+
+            # Run the blocking operation in a thread executor to avoid worker timeout
+            # This allows the async event loop to continue handling other events
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,  # Use default ThreadPoolExecutor
+                partial(processor.process_folder_enhanced, folder, mapping, config)
+            )
 
         except Exception as e:
             # If the processor crashes, create an error result to show the user
@@ -87,30 +105,21 @@ class AppState(rx.State):
                 message="A fatal error occurred during processing.",
                 errors=[str(e)]
             )
-        
-        # When the background task is done, it calls the finisher
-        # to update the UI on the main thread.
-        yield self.handle_processing_complete(result)
 
-    # ### PART 3: THE FINISHER EVENT HANDLER ###
-    # This is a regular event handler that is called by the background
-    # task. It safely updates the UI state with the final results.
-    def handle_processing_complete(self, result: processor.ProcessingResult):
-        """
-        Updates the UI state after the background processing is complete.
-        """
-        self.is_processing = False
-        if result.success:
-            output_count = len(result.output_files)
-            self.status = (
-                f"✅ Processing completed successfully! "
-                f"Created {output_count} output files."
-            )
-        else:
-            self.status = f"❌ Processing failed: {result.message}"
-            if result.errors:
-                error_summary = "; ".join(result.errors[:2])
-                self.status += f" Details: {error_summary}"
+        # Update state directly in the background task - no need to yield to another handler
+        async with self:
+            self.is_processing = False
+            if result.success:
+                output_count = len(result.output_files)
+                self.status = (
+                    f"✅ Processing completed successfully! "
+                    f"Created {output_count} output files."
+                )
+            else:
+                self.status = f"❌ Processing failed: {result.message}"
+                if result.errors:
+                    error_summary = "; ".join(result.errors[:2])
+                    self.status += f" Details: {error_summary}"
 
 def index() -> rx.Component:
     """The main user interface for the document processor."""
@@ -161,5 +170,6 @@ def index() -> rx.Component:
     )
 
 # Create the Reflex application
+# Timeout is configured in rxconfig.py instead of here
 app = rx.App()
 app.add_page(index, title="Document Processor")

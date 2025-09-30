@@ -20,4 +20,6 @@ config = rx.Config(
     # using it in this application, so disabling it avoids the
     # warnings shown by the CLI during startup.
     disable_plugins=["reflex.plugins.sitemap.SitemapPlugin"],
+    # Increase timeout for long-running background tasks (document processing)
+    worker_timeout=900,  # 15 minutes for PDF conversion and document processing
 )

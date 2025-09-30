@@ -21,6 +21,7 @@ import shutil
 import logging
 import locale
 import calendar
+import asyncio
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, NamedTuple, Union
 from dataclasses import dataclass
@@ -1607,14 +1608,131 @@ def create_pl_replacement_block(mapping_row: pd.Series, country_delimiter: str =
     return '\n\n'.join(full_content) if full_content else ''
 
 
+def _find_section_10_header(doc: Document, date_header: str) -> Optional[int]:
+    """
+    Find the paragraph index containing the Section 10 header.
+
+    Uses the language-specific date_header from the mapping file to identify
+    the correct Section 10 header paragraph.
+
+    Args:
+        doc: Document object
+        date_header: Language-specific header text from mapping file
+                    (e.g., 'Annex I Date Text' column)
+
+    Returns:
+        int: Paragraph index if found, None otherwise
+    """
+    date_header_lower = date_header.lower().strip()
+
+    # Store potential matches with scores for better selection
+    potential_matches = []
+
+    for idx, para in enumerate(doc.paragraphs):
+        text = para.text.strip()
+        text_lower = text.lower()
+
+        # Primary approach: Look for paragraph that contains the exact
+        # language-specific date header from the mapping file
+        if date_header_lower in text_lower:
+            # Additional validation: should also contain "10" to confirm it's Section 10
+            if '10' in text_lower:
+                print(f"✅ Found Section 10 header (exact match) at paragraph {idx}: '{text[:80]}...'")
+                return idx  # Exact match - return immediately
+
+        # Secondary approach: Look for section number pattern + length validation
+        # This handles cases where the header might be slightly different
+        if '10.' in text_lower:
+            # Must be at start of text or after whitespace (proper section header)
+            if text_lower.startswith('10.') or ' 10.' in text_lower:
+                # Must be substantial content (not just "10." alone)
+                if len(text_lower) > 15:  # More restrictive length requirement
+                    # Additional validation: should contain date-related keywords
+                    date_keywords = ['date', 'first', 'authorisation', 'authorization', 'renewal', 'fecha', 'première', 'première']
+                    if any(keyword in text_lower for keyword in date_keywords):
+                        score = len(text_lower)  # Longer headers get higher priority
+                        potential_matches.append((idx, score, text))
+
+    # If we have potential matches, return the one with highest score (longest text)
+    if potential_matches:
+        best_match = max(potential_matches, key=lambda x: x[1])
+        idx, score, text = best_match
+        print(f"✅ Found Section 10 header (pattern match) at paragraph {idx}: '{text[:80]}...'")
+        return idx
+
+    print(f"❌ Could not find Section 10 header with text: '{date_header}'")
+    return None
+
+
+def _insert_date_after_header(doc: Document, header_index: int, formatted_date: str) -> bool:
+    """
+    Insert date content in the paragraph immediately following the header.
+
+    Args:
+        doc: Document object
+        header_index: Index of the Section 10 header paragraph
+        formatted_date: Formatted date string to insert
+
+    Returns:
+        bool: True if successful
+    """
+    try:
+        # Check if next paragraph exists
+        if header_index + 1 < len(doc.paragraphs):
+            next_para = doc.paragraphs[header_index + 1]
+
+            # Clear existing content and insert date
+            next_para.clear()
+            run = next_para.add_run(formatted_date)
+            run.bold = False
+            print(f"✅ Date inserted in existing paragraph {header_index + 1}")
+            return True
+
+        else:
+            # Create new paragraph after header
+            # We need to use a different approach since python-docx doesn't have direct insertion
+            # Let's add a paragraph at the end and then move content around
+            new_para = doc.add_paragraph()
+            run = new_para.add_run(formatted_date)
+            run.bold = False
+
+            # Move the new paragraph to the correct position
+            # This is a workaround - we add at end then reorder
+            paragraphs = doc.paragraphs
+            if len(paragraphs) > header_index + 2:
+                # Move the last paragraph (our new one) to position header_index + 1
+                last_para_element = paragraphs[-1]._element
+                header_para_element = paragraphs[header_index]._element
+                header_para_element.addnext(last_para_element)
+
+            print(f"✅ Created new paragraph after header at position {header_index + 1}")
+            return True
+
+    except Exception as e:
+        print(f"❌ Error inserting date after header: {e}")
+        return False
+
+
 def update_section_10_date(doc: Document, mapping_row: pd.Series, mapping_file_path: Optional[str] = None) -> bool:
-    """Update date in Annex I Section 10."""
+    """
+    Update date in Annex I Section 10 - ENHANCED VERSION.
+
+    This function now:
+    1. Finds the Section 10 header using language-specific text from mapping file
+    2. Preserves the header paragraph unchanged
+    3. Inserts the formatted date in the next paragraph after the header
+    """
     country = mapping_row.get('Country', '')
     date_header = mapping_row.get('Annex I Date Text', 'Date of first authorisation/renewal of the authorisation')
-    
+
+    print(f"🔧 DEBUG: update_section_10_date called for {country}")
+    print(f"   Date header text: '{date_header}'")
+
     if not country:
+        print("❌ DEBUG: No country found, returning False")
         return False
-    
+
+    # Get formatted date (existing logic works fine)
     try:
         # Ensure date formatter is initialized
         if mapping_file_path:
@@ -1624,26 +1742,26 @@ def update_section_10_date(doc: Document, mapping_row: pd.Series, mapping_file_p
                 initialize_date_formatter(mapping_file_path)
 
         formatted_date = format_date_for_country(country, 'annex_i')
-    except Exception:
+        print(f"✅ Formatted date: '{formatted_date}'")
+    except Exception as e:
+        print(f"⚠️ Date formatting failed, using fallback: {e}")
         date_format = mapping_row.get('Annex I Date Format', '')
         formatted_date = datetime.now().strftime("%d %B %Y")
-    
-    found = False
-    for para in doc.paragraphs:
-        text_lower = para.text.lower()
-        
-        if ('10.' in text_lower and ('first authorisation' in text_lower or 
-            'date of first' in text_lower or 
-            date_header.lower() in text_lower or
-            'date of revision' in text_lower)):
-            
-            para.clear()
-            run = para.add_run(f"{date_header}\n{formatted_date}")
-            run.bold = False
-            found = True
-            break
-    
-    return found
+
+    # NEW: Find Section 10 header specifically using mapping file data
+    header_index = _find_section_10_header(doc, date_header)
+    if header_index is None:
+        print(f"❌ Could not find Section 10 header with text: '{date_header}'")
+        return False
+
+    # NEW: Insert date in next paragraph, preserving header
+    success = _insert_date_after_header(doc, header_index, formatted_date)
+    if success:
+        print(f"✅ Section 10 date inserted successfully for {country}")
+    else:
+        print(f"❌ Failed to insert Section 10 date for {country}")
+
+    return success
 
 def update_annex_iiib_date(doc: Document, mapping_row: pd.Series, mapping_file_path: Optional[str] = None) -> bool:
     """Update date in Annex IIIB Section 6."""
@@ -3204,15 +3322,39 @@ class DocumentProcessor:
                     message=f"No updates applied for {country} variant"
                 )
             
-            # Save and process updated document
-            return self._save_and_split_document(
+            # Save and process updated document - use synchronous wrapper
+            return self._save_and_split_document_sync(
                 doc, document_path, mapping_row, split_dir, pdf_dir, updates_applied
             )
             
         except Exception as e:
             raise DocumentError(f"Failed to process variant for {country}: {e}")
-    
-    def _save_and_split_document(
+
+    def _save_and_split_document_sync(
+        self,
+        doc: Document,
+        original_path: Path,
+        mapping_row: pd.Series,
+        split_dir: Path,
+        pdf_dir: Path,
+        updates_applied: List[str]
+    ) -> ProcessingResult:
+        """Synchronous wrapper that calls async version."""
+        import asyncio
+
+        # Run the async version in a new event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(
+                self._save_and_split_document(
+                    doc, original_path, mapping_row, split_dir, pdf_dir, updates_applied
+                )
+            )
+        finally:
+            loop.close()
+
+    async def _save_and_split_document(
         self,
         doc: Document,
         original_path: Path,
@@ -3265,7 +3407,7 @@ class DocumentProcessor:
                     import time
                     self.logger.info("🧹 Cleaning up resources between PDF conversions...")
                     gc.collect()  # Force garbage collection
-                    time.sleep(3)  # Wait 3 seconds for resource cleanup
+                    await asyncio.sleep(0.5) # Reduced to minimal delay - just enough for resource cleanup
 
                     # Try converting Annex IIIB
                     try:
