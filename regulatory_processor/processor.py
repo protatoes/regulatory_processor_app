@@ -71,6 +71,21 @@ from .hyperlinks import (
 )
 
 # Define utility functions that are processor-specific
+def _find_libreoffice_command():
+    """Find the available LibreOffice command on the system.
+
+    Returns:
+        str or None: The LibreOffice command name if found, None otherwise.
+    """
+    import shutil
+
+    # Try different possible LibreOffice command names
+    commands_to_try = ['soffice', 'libreoffice', 'loffice']
+    for cmd in commands_to_try:
+        if shutil.which(cmd):
+            return cmd
+    return None
+
 def convert_to_pdf(doc_path: str, output_dir: str) -> str:
     """Convert a Word document to PDF with multiple fallback methods and timeout protection."""
     import subprocess
@@ -92,12 +107,23 @@ def convert_to_pdf(doc_path: str, output_dir: str) -> str:
     # Method 1: Try LibreOffice (primary method)
     print(f"   🐧 Method 1: Attempting LibreOffice conversion...")
     sys.stdout.flush()
+
+    # Find the available LibreOffice command
+    libreoffice_cmd = _find_libreoffice_command()
+    if not libreoffice_cmd:
+        print(f"   ⚠️ No LibreOffice command found. Tried: soffice, libreoffice, loffice")
+    else:
+        print(f"   🔍 Using LibreOffice command: {libreoffice_cmd}")
+
     try:
+        if not libreoffice_cmd:
+            raise FileNotFoundError("LibreOffice command not available")
+
         # Redirect stdout to DEVNULL to prevent worker deadlocks.
         # Capture stderr (PIPE) to see potential errors from LibreOffice.
         result = subprocess.run(
             [
-                'libreoffice', '--headless', '--convert-to', 'pdf',
+                libreoffice_cmd, '--headless', '--convert-to', 'pdf',
                 '--outdir', str(output_dir), doc_path
             ],
             timeout=60,
@@ -107,7 +133,7 @@ def convert_to_pdf(doc_path: str, output_dir: str) -> str:
         )
 
         if result.returncode == 0 and pdf_output_path.exists():
-            print(f"   ✅ LibreOffice conversion successful")
+            print(f"   ✅ LibreOffice conversion successful using {libreoffice_cmd}")
             return str(pdf_output_path)
         else:
             # Provide more detailed error logging from LibreOffice's stderr
@@ -129,17 +155,17 @@ def convert_to_pdf(doc_path: str, output_dir: str) -> str:
     try:
         # Use subprocess to run docx2pdf with timeout control
         conversion_script = f'''
-        import sys
-        from docx2pdf import convert
-        import time
-        start_time = time.time()
-        try:
-            convert(r"{doc_path}", r"{pdf_output_path}")
-            print(f"Conversion completed in {{time.time() - start_time:.2f}} seconds")
-        except Exception as e:
-            print(f"Conversion failed: {{e}}")
-            sys.exit(1)
-            '''
+import sys
+from docx2pdf import convert
+import time
+start_time = time.time()
+try:
+    convert(r"{doc_path}", r"{pdf_output_path}")
+    print(f"Conversion completed in {{time.time() - start_time:.2f}} seconds")
+except Exception as e:
+    print(f"Conversion failed: {{e}}")
+    sys.exit(1)
+'''
         result = subprocess.run([
             'python', '-c', conversion_script
         ], capture_output=True, text=True, timeout=15)
