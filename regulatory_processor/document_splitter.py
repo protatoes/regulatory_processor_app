@@ -56,6 +56,20 @@ def clone_and_split_document(
     # Ensure output directory exists
     os.makedirs(output_dir, exist_ok=True)
 
+    # Extract all annex headers from mapping for proper boundary detection
+    all_annex_headers = []
+    if mapping_row is not None:
+        annex_i_header = mapping_row.get('Annex I Header in country language', '').strip()
+        annex_ii_header = mapping_row.get('Annex II Header in country language', '').strip()
+        annex_iiib_header = mapping_row.get('Annex IIIB Header in country language', '').strip()
+
+        # Add non-empty headers to the list
+        for header in [annex_i_header, annex_ii_header, annex_iiib_header]:
+            if header:
+                all_annex_headers.append(header)
+
+        logger.debug(f"📋 Extracted annex headers from mapping: {all_annex_headers}")
+
     result_paths = {}
 
     for annex in target_annexes:
@@ -68,7 +82,7 @@ def clone_and_split_document(
             clone_source_document(source_path, output_path)
 
             # Prune to target annex
-            success = prune_to_annex(output_path, annex)
+            success = prune_to_annex(output_path, annex, all_annex_headers)
 
             if success:
                 result_paths[annex] = output_path
@@ -111,7 +125,7 @@ def clone_source_document(source_path: str, output_path: str) -> str:
     return output_path
 
 
-def find_annex_boundaries(doc: Document, target_annex: str) -> Tuple[Optional[int], Optional[int]]:
+def find_annex_boundaries(doc: Document, target_annex: str, all_annex_headers: List[str] = None) -> Tuple[Optional[int], Optional[int]]:
     """
     Find the start and end paragraph indices for a specific annex.
     Handles proper annex boundary detection to avoid partial matches.
@@ -132,11 +146,15 @@ def find_annex_boundaries(doc: Document, target_annex: str) -> Tuple[Optional[in
     start_idx = None
     end_idx = None
 
-    # Normalize target for comparison
-    target_upper = target_annex.upper().strip()
+    # Normalize target for comparison - handle various space characters
+    def normalize_text(text):
+        """Normalize text by converting non-breaking spaces and other whitespace to regular spaces"""
+        return text.upper().strip().replace('\xa0', ' ').replace('\u00a0', ' ')
+
+    target_upper = normalize_text(target_annex)
 
     for i, para in enumerate(doc.paragraphs):
-        para_text = para.text.strip().upper()
+        para_text = normalize_text(para.text)
 
         # Found target annex start - use strict matching
         if start_idx is None and para_text.startswith(target_upper):
@@ -147,12 +165,22 @@ def find_annex_boundaries(doc: Document, target_annex: str) -> Tuple[Optional[in
                 logger.debug(f"📍 Found {target_annex} start at paragraph {i}: '{para.text[:50]}...'")
                 continue
 
-        # Found next annex (end of current annex)
-        if start_idx is not None and para_text.startswith("ANNEX"):
-            # Make sure it's not the same annex continuing
-            if not para_text.startswith(target_upper):
-                end_idx = i
-                logger.debug(f"🔚 Found {target_annex} end at paragraph {i}: '{para.text[:50]}...'")
+        # Found next annex (end of current annex) - use mapping file headers
+        if start_idx is not None:
+            if all_annex_headers is None:
+                raise ValueError("all_annex_headers parameter is required for proper annex boundary detection")
+
+            # Check if this paragraph starts any known annex header
+            for header in all_annex_headers:
+                header_upper = normalize_text(header)
+                if para_text.startswith(header_upper):
+                    # Make sure it's not the same annex continuing
+                    if not para_text.startswith(target_upper):
+                        end_idx = i
+                        logger.debug(f"🔚 Found {target_annex} end at paragraph {i}: '{para.text[:50]}...'")
+                        break
+
+            if end_idx is not None:
                 break
 
     # If no end found, assume it goes to document end
@@ -163,7 +191,7 @@ def find_annex_boundaries(doc: Document, target_annex: str) -> Tuple[Optional[in
     return start_idx, end_idx
 
 
-def prune_to_annex(doc_path: str, target_annex: str) -> bool:
+def prune_to_annex(doc_path: str, target_annex: str, all_annex_headers: List[str] = None) -> bool:
     """
     Remove all content except the target annex from the document.
     Iterates through document body to correctly handle both paragraphs AND tables.
@@ -184,7 +212,7 @@ def prune_to_annex(doc_path: str, target_annex: str) -> bool:
         doc = Document(doc_path)
 
         # Find annex boundaries
-        start_idx, end_idx = find_annex_boundaries(doc, target_annex)
+        start_idx, end_idx = find_annex_boundaries(doc, target_annex, all_annex_headers)
 
         if start_idx is None:
             logger.error(f"❌ Could not find start marker for {target_annex} in document")
