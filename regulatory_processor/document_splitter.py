@@ -81,8 +81,12 @@ def clone_and_split_document(
             # Clone source document
             clone_source_document(source_path, output_path)
 
+            # Determine if this is Annex I from mapping data
+            is_annex_i = (mapping_row is not None and
+                         annex == mapping_row.get('Annex I Header in country language', '').strip())
+
             # Prune to target annex
-            success = prune_to_annex(output_path, annex, all_annex_headers)
+            success = prune_to_annex(output_path, annex, all_annex_headers, is_annex_i)
 
             if success:
                 result_paths[annex] = output_path
@@ -125,7 +129,7 @@ def clone_source_document(source_path: str, output_path: str) -> str:
     return output_path
 
 
-def find_annex_boundaries(doc: Document, target_annex: str, all_annex_headers: List[str] = None) -> Tuple[Optional[int], Optional[int]]:
+def find_annex_boundaries(doc: Document, target_annex: str, all_annex_headers: List[str] = None, is_annex_i: bool = False) -> Tuple[Optional[int], Optional[int]]:
     """
     Find the start and end paragraph indices for a specific annex.
     Handles proper annex boundary detection to avoid partial matches.
@@ -133,12 +137,16 @@ def find_annex_boundaries(doc: Document, target_annex: str, all_annex_headers: L
     Args:
         doc: Document to search
         target_annex: Annex identifier (e.g., "ANNEX I", "ANNEX II", "ANNEX IIIB")
+        all_annex_headers: List of all known annex headers from mapping file
+        is_annex_i: True if this is Annex I (starts from document beginning)
 
     Returns:
         Tuple of (start_index, end_index) or (None, None) if not found
 
     Note:
         - Uses strict matching to avoid "ANNEX I" matching "ANNEX III"
+        - For Annex I: starts from paragraph 0 to preserve title pages and intro content
+        - For other annexes: starts from their header location
         - If no end marker found, assumes annex extends to document end
     """
     logger.debug(f"🔍 Finding boundaries for {target_annex}")
@@ -153,11 +161,17 @@ def find_annex_boundaries(doc: Document, target_annex: str, all_annex_headers: L
 
     target_upper = normalize_text(target_annex)
 
+    # Special case: For Annex I, start from beginning of document (paragraph 0)
+    # This preserves title pages and introductory content
+    if is_annex_i:
+        start_idx = 0
+        logger.debug(f"📍 Annex I detected - starting from document beginning (paragraph 0)")
+
     for i, para in enumerate(doc.paragraphs):
         para_text = normalize_text(para.text)
 
-        # Found target annex start - use strict matching
-        if start_idx is None and para_text.startswith(target_upper):
+        # Found target annex start - use strict matching (skip for Annex I since we start at 0)
+        if not is_annex_i and start_idx is None and para_text.startswith(target_upper):
             # Additional check: ensure it's not a substring match
             # e.g., "ANNEX I" should not match "ANNEX III"
             if para_text == target_upper or para_text.startswith(target_upper + " "):
@@ -191,7 +205,7 @@ def find_annex_boundaries(doc: Document, target_annex: str, all_annex_headers: L
     return start_idx, end_idx
 
 
-def prune_to_annex(doc_path: str, target_annex: str, all_annex_headers: List[str] = None) -> bool:
+def prune_to_annex(doc_path: str, target_annex: str, all_annex_headers: List[str] = None, is_annex_i: bool = False) -> bool:
     """
     Remove all content except the target annex from the document.
     Iterates through document body to correctly handle both paragraphs AND tables.
@@ -212,7 +226,7 @@ def prune_to_annex(doc_path: str, target_annex: str, all_annex_headers: List[str
         doc = Document(doc_path)
 
         # Find annex boundaries
-        start_idx, end_idx = find_annex_boundaries(doc, target_annex, all_annex_headers)
+        start_idx, end_idx = find_annex_boundaries(doc, target_annex, all_annex_headers, is_annex_i)
 
         if start_idx is None:
             logger.error(f"❌ Could not find start marker for {target_annex} in document")
