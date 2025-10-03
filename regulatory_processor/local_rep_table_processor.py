@@ -32,10 +32,10 @@ class LocalRepTableProcessor:
         Returns:
             bool: True if table was successfully processed, False otherwise
         """
-        target_country = mapping_row.get('Country', '').strip()
+        target_country = mapping_row.get('Line 1 - Country names to be bolded - SmPC', '').strip()
 
         # Always convert to country list (handles both single and combined countries)
-        country_list = [c.strip() for c in target_country.split('/')]
+        country_list = [c.strip() for c in target_country.split(';')]
 
         print(f"🔧 DEBUG: LocalRepTableProcessor.process_local_rep_table called")
         print(f"   Target countries: {country_list}")
