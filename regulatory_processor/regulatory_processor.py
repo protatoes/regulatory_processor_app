@@ -79,10 +79,11 @@ class AppState(rx.State):
             self.status = "Initializing document processing..."
 
         try:
-            # Create processing configuration
+            # Create processing configuration - skip PDF conversion in executor
             config = processor.ProcessingConfig(
                 create_backups=True,
                 convert_to_pdf=True,
+                skip_pdf_in_background=True,  # Skip PDF to avoid ThreadPoolExecutor deadlock
                 log_level="INFO"
             )
 
@@ -90,13 +91,21 @@ class AppState(rx.State):
             async with self:
                 self.status = "Processing documents (this may take several minutes)..."
 
-            # Run the blocking operation in a thread executor to avoid worker timeout
-            # This allows the async event loop to continue handling other events
+            # Run document processing in executor (no PDF conversion happens here)
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
                 None,  # Use default ThreadPoolExecutor
                 partial(processor.process_folder_enhanced, folder, mapping, config)
             )
+
+            # PDF conversion happens HERE - outside the executor
+            if result.success and result.pending_pdf_conversions:
+                async with self:
+                    self.status = f"Converting {len(result.pending_pdf_conversions)} documents to PDF..."
+
+                # Run conversions outside executor context
+                pdf_results = await self._convert_pdfs_outside_executor(result.pending_pdf_conversions)
+                result.output_files.extend(pdf_results)
 
         except Exception as e:
             # If the processor crashes, create an error result to show the user
@@ -111,15 +120,36 @@ class AppState(rx.State):
             self.is_processing = False
             if result.success:
                 output_count = len(result.output_files)
+                pdf_count = len([f for f in result.output_files if f.endswith('.pdf')])
                 self.status = (
                     f"✅ Processing completed successfully! "
-                    f"Created {output_count} output files."
+                    f"Created {output_count} files ({pdf_count} PDFs)."
                 )
             else:
                 self.status = f"❌ Processing failed: {result.message}"
                 if result.errors:
                     error_summary = "; ".join(result.errors[:2])
                     self.status += f" Details: {error_summary}"
+
+    async def _convert_pdfs_outside_executor(self, conversions) -> list:
+        """Run PDF conversions outside executor in async context."""
+        pdf_files = []
+
+        for doc_path, output_dir in conversions:
+            # Run in executor but as individual calls, not nested inside document processing
+            loop = asyncio.get_event_loop()
+            try:
+                pdf_path = await loop.run_in_executor(
+                    None,
+                    processor.convert_to_pdf,
+                    doc_path,
+                    output_dir
+                )
+                pdf_files.append(pdf_path)
+            except Exception as e:
+                print(f"PDF conversion failed for {doc_path}: {e}")
+
+        return pdf_files
 
 def index() -> rx.Component:
     """The main user interface for the document processor."""

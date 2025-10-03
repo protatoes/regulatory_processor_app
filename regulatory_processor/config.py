@@ -1,7 +1,7 @@
 """Configuration classes and constants for the regulatory processor."""
 
-from dataclasses import dataclass
-from typing import NamedTuple, List
+from dataclasses import dataclass, field
+from typing import NamedTuple, List, Tuple
 
 
 # =============================================================================
@@ -40,6 +40,7 @@ class ProcessingConfig:
     overwrite_existing: bool = False
     log_level: str = "INFO"
     country_delimiter: str = ";"
+    skip_pdf_in_background: bool = False  # Skip PDF conversion in ThreadPoolExecutor context
 
 
 @dataclass
@@ -70,12 +71,14 @@ class HyperlinkProcessingConfig:
 # RESULT AND STATUS CLASSES
 # =============================================================================
 
-class ProcessingResult(NamedTuple):
+@dataclass
+class ProcessingResult:
     """Result of document processing operations."""
     success: bool
     message: str
-    output_files: List[str] = []
-    errors: List[str] = []
+    output_files: List[str] = field(default_factory=list)
+    errors: List[str] = field(default_factory=list)
+    pending_pdf_conversions: List[Tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass

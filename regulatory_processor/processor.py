@@ -39,10 +39,7 @@ from docx.oxml import OxmlElement
 from regulatory_processor.document_splitter import (
     clone_and_split_document,
     copy_paragraph, copy_table, _copy_paragraph_content,
-    copy_document_structure, copy_headers_and_footers, copy_styles,
-    copy_paragraph_safe, copy_table_safe, copy_document_settings_safe,
-    copy_document_properties, get_document_elements_in_order,
-    extract_section_safe_copy, extract_section_xml
+    copy_document_structure, copy_headers_and_footers, copy_styles
 )
 from docx2pdf import convert
 
@@ -71,6 +68,148 @@ from .hyperlinks import (
 )
 
 # Define utility functions that are processor-specific
+
+class ThreadSafePDFConverter:
+    """
+    Singleton class to handle PDF conversion in a thread-safe manner.
+
+    LibreOffice has issues when run from multiple threads simultaneously,
+    so we use a dedicated thread with a queue to serialize all PDF conversions.
+    """
+    _instance = None
+    _lock = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            import threading
+            cls._lock = threading.Lock()
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+
+        import threading
+        import queue
+        import os
+
+        self._initialized = True
+        self._conversion_queue = queue.Queue()
+        self._worker_thread = None
+        self._shutdown_event = threading.Event()
+        self._start_worker()
+
+    def _start_worker(self):
+        """Start the worker thread that handles PDF conversions."""
+        import threading
+
+        if self._worker_thread is None or not self._worker_thread.is_alive():
+            self._worker_thread = threading.Thread(
+                target=self._worker_loop,
+                daemon=True,
+                name="PDFConverter"
+            )
+            self._worker_thread.start()
+
+    def _worker_loop(self):
+        """Main loop for the PDF conversion worker thread."""
+        import subprocess
+        import os
+        import time
+        from pathlib import Path
+
+        while not self._shutdown_event.is_set():
+            try:
+                # Get conversion task from queue (timeout to check shutdown)
+                task = self._conversion_queue.get(timeout=1.0)
+                if task is None:  # Sentinel value for shutdown
+                    break
+
+                doc_path, output_dir, result_queue = task
+
+                try:
+                    # Perform the actual LibreOffice conversion
+                    pdf_output_path = Path(output_dir) / Path(doc_path).with_suffix(".pdf").name
+
+                    # Find LibreOffice command
+                    libreoffice_cmd = _find_libreoffice_command()
+                    if not libreoffice_cmd:
+                        result_queue.put(("error", "LibreOffice command not found"))
+                        continue
+
+                    # Set environment variables for headless operation
+                    env = os.environ.copy()
+                    env.update({
+                        'DISPLAY': ':0.0' if 'DISPLAY' not in env else env['DISPLAY'],
+                        'LIBGL_ALWAYS_SOFTWARE': '1',  # Force software rendering
+                        'QT_QPA_PLATFORM': 'offscreen',  # Qt platform for headless
+                    })
+
+                    # Run LibreOffice conversion
+                    result = subprocess.run(
+                        [
+                            libreoffice_cmd, '--headless', '--convert-to', 'pdf',
+                            '--outdir', str(output_dir), doc_path
+                        ],
+                        timeout=60,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        env=env  # Pass explicit environment
+                    )
+
+                    if result.returncode == 0 and pdf_output_path.exists():
+                        result_queue.put(("success", str(pdf_output_path)))
+                    else:
+                        error_msg = result.stderr if result.stderr else f"Return code: {result.returncode}"
+                        result_queue.put(("error", f"LibreOffice failed: {error_msg}"))
+
+                except subprocess.TimeoutExpired:
+                    result_queue.put(("error", "LibreOffice conversion timed out"))
+                except Exception as e:
+                    result_queue.put(("error", f"Conversion error: {str(e)}"))
+                finally:
+                    self._conversion_queue.task_done()
+
+            except Exception:
+                # Queue timeout or other error - continue loop
+                continue
+
+    def convert(self, doc_path: str, output_dir: str, timeout: float = 70.0) -> tuple[str, str]:
+        """
+        Convert document to PDF using the dedicated worker thread.
+
+        Args:
+            doc_path: Path to the input document
+            output_dir: Directory for output PDF
+            timeout: Maximum time to wait for conversion
+
+        Returns:
+            tuple: (status, result) where status is 'success' or 'error'
+        """
+        import queue
+        import threading
+
+        # Ensure worker is running
+        self._start_worker()
+
+        # Create result queue for this conversion
+        result_queue = queue.Queue()
+
+        # Submit conversion task
+        self._conversion_queue.put((doc_path, output_dir, result_queue))
+
+        # Wait for result with timeout
+        try:
+            status, result = result_queue.get(timeout=timeout)
+            return status, result
+        except queue.Empty:
+            return "error", "Conversion timed out waiting for worker thread"
+
 def _find_libreoffice_command():
     """Find the available LibreOffice command on the system.
 
@@ -87,67 +226,40 @@ def _find_libreoffice_command():
     return None
 
 def convert_to_pdf(doc_path: str, output_dir: str) -> str:
-    """Convert a Word document to PDF with multiple fallback methods and timeout protection."""
-    import subprocess
+    """Convert a Word document to PDF using thread-safe converter with multiple fallback methods."""
     import time
     import gc
     from pathlib import Path
-    import sys  # Import sys to flush stdout
+    import sys
 
     # Force cleanup before conversion
     gc.collect()
 
     pdf_output_path = Path(output_dir) / Path(doc_path).with_suffix(".pdf").name
     print(f"   🔄 Converting: {Path(doc_path).name} → {pdf_output_path.name}")
-    sys.stdout.flush() # Force the log message to appear immediately
+    sys.stdout.flush()
 
     # Add small delay to prevent resource conflicts
     time.sleep(0.5)
 
-    # Method 1: Try LibreOffice (primary method)
-    print(f"   🐧 Method 1: Attempting LibreOffice conversion...")
+    # Method 1: Try thread-safe LibreOffice converter (primary method)
+    print(f"   🐧 Method 1: Using thread-safe LibreOffice conversion...")
     sys.stdout.flush()
 
-    # Find the available LibreOffice command
-    libreoffice_cmd = _find_libreoffice_command()
-    if not libreoffice_cmd:
-        print(f"   ⚠️ No LibreOffice command found. Tried: soffice, libreoffice, loffice")
-    else:
-        print(f"   🔍 Using LibreOffice command: {libreoffice_cmd}")
-
     try:
-        if not libreoffice_cmd:
-            raise FileNotFoundError("LibreOffice command not available")
+        # Use the thread-safe PDF converter
+        converter = ThreadSafePDFConverter()
+        status, result = converter.convert(doc_path, output_dir, timeout=70.0)
 
-        # Redirect stdout to DEVNULL to prevent worker deadlocks.
-        # Capture stderr (PIPE) to see potential errors from LibreOffice.
-        result = subprocess.run(
-            [
-                libreoffice_cmd, '--headless', '--convert-to', 'pdf',
-                '--outdir', str(output_dir), doc_path
-            ],
-            timeout=60,
-            stdout=subprocess.DEVNULL, # Discard standard output
-            stderr=subprocess.PIPE,     # Capture standard error
-            text=True                   # Decode stderr as text
-        )
-
-        if result.returncode == 0 and pdf_output_path.exists():
-            print(f"   ✅ LibreOffice conversion successful using {libreoffice_cmd}")
-            return str(pdf_output_path)
+        if status == "success":
+            print(f"   ✅ Thread-safe LibreOffice conversion successful")
+            return result
         else:
-            # Provide more detailed error logging from LibreOffice's stderr
-            error_message = result.stderr if result.stderr else "No error message from LibreOffice."
-            print(f"   ⚠️ LibreOffice conversion failed (Code: {result.returncode}): {error_message}")
-            # Raise an exception to trigger fallback methods
-            raise RuntimeError(f"LibreOffice failed with code {result.returncode}")
+            print(f"   ⚠️ Thread-safe LibreOffice conversion failed: {result}")
+            raise RuntimeError(f"Thread-safe LibreOffice failed: {result}")
 
-    except subprocess.TimeoutExpired:
-        print(f"   ⚠️ LibreOffice conversion timed out after 60 seconds")
-    except FileNotFoundError:
-        print(f"   ⚠️ LibreOffice command not found. Ensure it is installed and in your system's PATH.")
     except Exception as e:
-        print(f"   ⚠️ An unexpected error occurred with LibreOffice: {e}")
+        print(f"   ⚠️ Thread-safe LibreOffice conversion error: {e}")
 
     # Method 2: Try docx2pdf with timeout protection (fallback method)
     print(f"   📝 Method 2: Attempting docx2pdf conversion...")
@@ -2098,8 +2210,7 @@ def split_annexes(source_path: str, output_dir: str, language: str, country: str
         annex_iiib_path = result_paths.get(annex_iiib_header)
 
         if not annex_i_path or not annex_iiib_path:
-            print("⚠️ Clone-and-prune failed, falling back to original method")
-            return split_annexes_three_headers_with_fallback(source_path, output_dir, language, country, mapping_row)
+            raise ValueError(f"Failed to split document - could not find required annexes. Found: {list(result_paths.keys())}")
 
         print(f"✅ Successfully split documents using clone-and-prune:")
         print(f"   ANNEX I: {annex_i_path}")
@@ -2108,567 +2219,12 @@ def split_annexes(source_path: str, output_dir: str, language: str, country: str
         return annex_i_path, annex_iiib_path
 
     except Exception as e:
-        print(f"⚠️ Clone-and-prune error: {e}")
-        print("🔄 Falling back to original splitting method...")
-        return split_annexes_three_headers_with_fallback(source_path, output_dir, language, country, mapping_row)
-
-def split_annexes_enhanced(source_path: str, output_dir: str, language: str, country: str, mapping_row: pd.Series) -> Tuple[str, str]:
-    """
-    Split a combined SmPC document into Annex I and Annex IIIB documents using language-specific headers.
-    
-    This enhanced version uses the mapping file's language-specific headers and implements
-    a bottom-up approach:
-    1. First identify and split Annex IIIB (using "Annex IIIB Header in country language")
-    2. Then identify and split Annex II (using "Annex II Header in country language") 
-    3. Everything that remains becomes Annex I
-    
-    Args:
-        source_path: Path to the combined document
-        output_dir: Directory to save split documents
-        language: Language of the document
-        country: Country of the document
-        mapping_row: Row from mapping file containing language-specific headers
-        
-    Returns:
-        Tuple of (annex_i_path, annex_iiib_path)
-    """
-    
-    # Load the document
-    doc = Document(source_path)
-    
-    # Get language-specific headers from mapping file
-    annex_ii_header = str(mapping_row.get('Annex II Header in country language', '')).strip()
-    annex_iiib_header = str(mapping_row.get('Annex IIIB Header in country language', '')).strip()
-    
-    # Validate headers are available
-    if not annex_ii_header or annex_ii_header.lower() == 'nan':
-        raise ValueError(f"Missing Annex II header for {country} ({language})")
-    if not annex_iiib_header or annex_iiib_header.lower() == 'nan':
-        raise ValueError(f"Missing Annex IIIB header for {country} ({language})")
-    
-    print(f"🔍 Using headers for {country} ({language}):")
-    print(f"   Annex II: '{annex_ii_header}'")
-    print(f"   Annex IIIB: '{annex_iiib_header}'")
-    
-    # Find split points by scanning all paragraphs
-    annex_ii_split_index = None
-    annex_iiib_split_index = None
-    
-    for idx, para in enumerate(doc.paragraphs):
-        text = para.text.strip()
-        
-        # Look for Annex II header (case-insensitive, flexible matching)
-        if annex_ii_split_index is None and is_header_match(text, annex_ii_header):
-            annex_ii_split_index = idx
-            print(f"✅ Found Annex II header at paragraph {idx}: '{text[:50]}...'")
-
-        # Look for Annex IIIB header (case-insensitive, flexible matching)
-        if annex_iiib_split_index is None and is_header_match(text, annex_iiib_header):
-            annex_iiib_split_index = idx
-            print(f"✅ Found Annex IIIB header at paragraph {idx}: '{text[:50]}...'")
-    
-    # Validate that we found the required headers
-    if annex_ii_split_index is None:
-        raise ValueError(f"Could not find Annex II header '{annex_ii_header}' in document")
-    if annex_iiib_split_index is None:
-        raise ValueError(f"Could not find Annex IIIB header '{annex_iiib_header}' in document")
-    
-    # Ensure proper order (Annex II should come before Annex IIIB)
-    if annex_ii_split_index >= annex_iiib_split_index:
-        raise ValueError(f"Document structure error: Annex II (para {annex_ii_split_index}) should come before Annex IIIB (para {annex_iiib_split_index})")
-    
-    print(f"📊 Split points identified:")
-    print(f"   Annex I: paragraphs 0 to {annex_ii_split_index - 1}")
-    print(f"   Annex II: paragraphs {annex_ii_split_index} to {annex_iiib_split_index - 1}")
-    print(f"   Annex IIIB: paragraphs {annex_iiib_split_index} to end")
-
-    # Create new documents
-    annex_i_doc = Document()
-    annex_iiib_doc = Document()
-
-    # Copy document structure (headers, footers, page setup, styles) to both new documents
-    print("📋 Copying document structure (headers, footers, page setup)...")
-    copy_document_structure(doc, annex_i_doc)
-    copy_document_structure(doc, annex_iiib_doc)
-
-    print("📋 Copying headers and footers...")
-    copy_headers_and_footers(doc, annex_i_doc)
-    copy_headers_and_footers(doc, annex_iiib_doc)
-
-    print("📋 Copying document styles...")
-    copy_styles(doc, annex_i_doc)
-    copy_styles(doc, annex_iiib_doc)
-
-    # Split the document based on identified boundaries, handling all document elements
-    # We need to track both paragraphs and tables in document order
-    element_index = 0
-
-    # Process all document elements (paragraphs and tables) in order
-    from docx.document import Document as DocxDocument
-    from docx.table import Table
-    from docx.text.paragraph import Paragraph
-
-    # Create ordered list of all document elements (paragraphs and tables) with correct indexing
-    document_elements = []
-    paragraph_counter = 0
-    table_counter = 0
-
-    # Process document body elements in order to maintain document structure
-    for element in doc.element.body:
-        if element.tag.endswith('p'):  # Paragraph element
-            if paragraph_counter < len(doc.paragraphs):
-                document_elements.append(('paragraph', paragraph_counter, doc.paragraphs[paragraph_counter]))
-                paragraph_counter += 1
-        elif element.tag.endswith('tbl'):  # Table element
-            if table_counter < len(doc.tables):
-                document_elements.append(('table', table_counter, doc.tables[table_counter]))
-                table_counter += 1
-
-    print(f"📊 Document structure analysis:")
-    print(f"   Total elements: {len(document_elements)}")
-    print(f"   Paragraphs: {paragraph_counter}")
-    print(f"   Tables: {table_counter}")
-
-    # Create mapping from paragraph index to element position for boundary calculation
-    para_to_element_map = {}
-    element_para_count = 0
-
-    for elem_idx, (elem_type, original_idx, _) in enumerate(document_elements):
-        if elem_type == 'paragraph':
-            para_to_element_map[element_para_count] = elem_idx
-            element_para_count += 1
-
-    # Calculate element boundaries based on paragraph split points
-    annex_ii_element_boundary = para_to_element_map.get(annex_ii_split_index, len(document_elements))
-    annex_iiib_element_boundary = para_to_element_map.get(annex_iiib_split_index, len(document_elements))
-
-    print(f"📊 Element boundaries:")
-    print(f"   Annex I: elements 0 to {annex_ii_element_boundary - 1}")
-    print(f"   Annex II: elements {annex_ii_element_boundary} to {annex_iiib_element_boundary - 1}")
-    print(f"   Annex IIIB: elements {annex_iiib_element_boundary} to {len(document_elements) - 1}")
-
-    # Copy elements to appropriate documents in correct order
-    annex_i_elements = 0
-    annex_iiib_elements = 0
-
-    for elem_idx, (elem_type, original_idx, elem_obj) in enumerate(document_elements):
-        if elem_idx < annex_ii_element_boundary:
-            # Annex I content (everything before Annex II)
-            if elem_type == 'paragraph':
-                copy_paragraph(annex_i_doc, elem_obj)
-            elif elem_type == 'table':
-                copy_table(annex_i_doc, elem_obj)
-            annex_i_elements += 1
-
-        elif elem_idx >= annex_iiib_element_boundary:
-            # Annex IIIB content (everything from Annex IIIB header onwards)
-            if elem_type == 'paragraph':
-                copy_paragraph(annex_iiib_doc, elem_obj)
-            elif elem_type == 'table':
-                copy_table(annex_iiib_doc, elem_obj)
-            annex_iiib_elements += 1
-
-        # Note: We skip Annex II content (between boundaries)
-        # as we only need Annex I and Annex IIIB for the final output
-
-    print(f"📋 Elements copied:")
-    print(f"   Annex I: {annex_i_elements} elements")
-    print(f"   Annex IIIB: {annex_iiib_elements} elements")
-    
-    # Generate output paths
-    base_name = Path(source_path).stem
-    annex_i_filename = generate_output_filename(base_name, language, country, "annex_i")
-    annex_iiib_filename = generate_output_filename(base_name, language, country, "annex_iiib")
-    
-    annex_i_path = os.path.join(output_dir, annex_i_filename)
-    annex_iiib_path = os.path.join(output_dir, annex_iiib_filename)
-    
-    # Save documents
-    annex_i_doc.save(annex_i_path)
-    annex_iiib_doc.save(annex_iiib_path)
-    
-    print(f"💾 Created: {annex_i_filename}")
-    print(f"💾 Created: {annex_iiib_filename}")
-    
-    return annex_i_path, annex_iiib_path
-
-def split_annexes_three_headers_xml(source_path: str, output_dir: str, language: str, country: str, mapping_row: pd.Series) -> Tuple[str, str]:
-    """
-    Split document using all three headers with XML-based approach to preserve all formatting.
-    
-    This method:
-    1. Finds all three annex headers to define precise boundaries
-    2. Uses XML manipulation to preserve tables, images, formatting, etc.
-    3. Creates clean splits without losing any document elements
-    
-    Args:
-        source_path: Path to the combined document
-        output_dir: Directory to save split documents  
-        language: Language of the document
-        country: Country of the document
-        mapping_row: Row from mapping file containing all three language-specific headers
-        
-    Returns:
-        Tuple of (annex_i_path, annex_iiib_path)
-    """
-    
-    print(f"\n🔬 THREE-HEADER XML SPLITTING")
-    print(f"File: {Path(source_path).name}")
-    print(f"Country: {country} ({language})")
-    
-    # Load the document
-    doc = Document(source_path)
-    
-    # Get all three language-specific headers from mapping file
-    annex_i_header = str(mapping_row.get('Annex I Header in country language', '')).strip()
-    annex_ii_header = str(mapping_row.get('Annex II Header in country language', '')).strip()
-    annex_iiib_header = str(mapping_row.get('Annex IIIB Header in country language', '')).strip()
-    
-    # Validate all headers are available
-    if not annex_i_header or annex_i_header.lower() == 'nan':
-        raise ValueError(f"Missing Annex I header for {country} ({language})")
-    if not annex_ii_header or annex_ii_header.lower() == 'nan':
-        raise ValueError(f"Missing Annex II header for {country} ({language})")
-    if not annex_iiib_header or annex_iiib_header.lower() == 'nan':
-        raise ValueError(f"Missing Annex IIIB header for {country} ({language})")
-    
-    print(f"🎯 Target headers:")
-    print(f"   Annex I: '{annex_i_header}'")
-    print(f"   Annex II: '{annex_ii_header}'")
-    print(f"   Annex IIIB: '{annex_iiib_header}'")
-    
-    # Find all header positions
-    header_positions = find_header_positions(doc, annex_i_header, annex_ii_header, annex_iiib_header)
-    
-    if not header_positions['annex_i']:
-        raise ValueError(f"Could not find Annex I header '{annex_i_header}' in document")
-    if not header_positions['annex_ii']:
-        raise ValueError(f"Could not find Annex II header '{annex_ii_header}' in document")
-    if not header_positions['annex_iiib']:
-        raise ValueError(f"Could not find Annex IIIB header '{annex_iiib_header}' in document")
-    
-    # Validate header order
-    validate_header_order(header_positions)
-    
-    print(f"✅ Header positions validated:")
-    print(f"   Annex I: Paragraph {header_positions['annex_i']}")
-    print(f"   Annex II: Paragraph {header_positions['annex_ii']}")
-    print(f"   Annex IIIB: Paragraph {header_positions['annex_iiib']}")
-    
-    # Extract sections using XML manipulation
-    # FIXED: Annex I should start from document beginning (0), not from Annex I header
-    annex_i_doc = extract_section_xml(doc,
-                                      start_idx=0,  # Document beginning, not header_positions['annex_i']
-                                      end_idx=header_positions['annex_ii'])
-    
-    annex_iiib_doc = extract_section_xml(doc, 
-                                         start_idx=header_positions['annex_iiib'], 
-                                         end_idx=None)  # To end of document
-    
-    # Generate output paths
-    base_name = Path(source_path).stem
-    annex_i_filename = generate_output_filename(base_name, language, country, "annex_i")
-    annex_iiib_filename = generate_output_filename(base_name, language, country, "annex_iiib")
-    
-    annex_i_path = os.path.join(output_dir, annex_i_filename)
-    annex_iiib_path = os.path.join(output_dir, annex_iiib_filename)
-    
-    # Save documents
-    annex_i_doc.save(annex_i_path)
-    annex_iiib_doc.save(annex_iiib_path)
-    
-    print(f"💾 Created with XML preservation:")
-    print(f"   {annex_i_filename}")
-    print(f"   {annex_iiib_filename}")
-    
-    return annex_i_path, annex_iiib_path
+        print(f"❌ Clone-and-prune error: {e}")
+        raise ProcessingError(f"Document splitting failed: {e}") from e
 
 
-def find_header_positions(doc: Document, annex_i_header: str, annex_ii_header: str, annex_iiib_header: str) -> Dict[str, int]:
-    """
-    Find the paragraph positions of all three annex headers.
-    
-    Returns:
-        Dictionary with keys 'annex_i', 'annex_ii', 'annex_iiib' and paragraph indices as values
-    """
-    
-    positions = {'annex_i': None, 'annex_ii': None, 'annex_iiib': None}
-    
-    # Find best match for each header
-    for idx, para in enumerate(doc.paragraphs):
-        text = para.text.strip()
-        
-        # Check for Annex I header
-        if positions['annex_i'] is None and _is_header_match(text, annex_i_header):
-            positions['annex_i'] = idx
-            print(f"✅ Found Annex I header at paragraph {idx}: '{text[:50]}...'")
-        
-        # Check for Annex II header
-        if positions['annex_ii'] is None and _is_header_match(text, annex_ii_header):
-            positions['annex_ii'] = idx
-            print(f"✅ Found Annex II header at paragraph {idx}: '{text[:50]}...'")
-        
-        # Check for Annex IIIB header
-        if positions['annex_iiib'] is None and _is_header_match(text, annex_iiib_header):
-            positions['annex_iiib'] = idx
-            print(f"✅ Found Annex IIIB header at paragraph {idx}: '{text[:50]}...'")
-    
-    return positions
 
 
-def validate_header_order(positions: Dict[str, int]) -> None:
-    """
-    Validate that headers are in the correct order: I < II < IIIB.
-    
-    Args:
-        positions: Dictionary with header positions
-        
-    Raises:
-        ValueError: If headers are not in correct order
-    """
-    
-    annex_i_pos = positions['annex_i']
-    annex_ii_pos = positions['annex_ii']
-    annex_iiib_pos = positions['annex_iiib']
-    
-    if annex_i_pos >= annex_ii_pos:
-        raise ValueError(f"Document structure error: Annex I (para {annex_i_pos}) should come before Annex II (para {annex_ii_pos})")
-    
-    if annex_ii_pos >= annex_iiib_pos:
-        raise ValueError(f"Document structure error: Annex II (para {annex_ii_pos}) should come before Annex IIIB (para {annex_iiib_pos})")
-    
-    print(f"📊 Document structure validated:")
-    print(f"   Annex I: {annex_iiib_pos - annex_i_pos} paragraphs")
-    print(f"   Annex II: {annex_iiib_pos - annex_ii_pos} paragraphs") 
-    print(f"   Annex IIIB: Continues to end of document")
-
-
-def extract_section_xml(source_doc: Document, start_idx: int, end_idx: Optional[int] = None) -> Document:
-    """
-    Extract a section from the source document using safe paragraph copying to avoid XML corruption.
-    
-    This approach prioritizes document integrity over advanced XML preservation.
-    
-    Args:
-        source_doc: Source document to extract from
-        start_idx: Starting paragraph index (inclusive)
-        end_idx: Ending paragraph index (exclusive). If None, goes to end of document.
-        
-    Returns:
-        New document containing the extracted section without corruption
-    """
-    
-    # Determine which paragraphs to include
-    total_paragraphs = len(source_doc.paragraphs)
-    actual_end_idx = end_idx if end_idx is not None else total_paragraphs
-    
-    print(f"📋 Extracting paragraphs {start_idx} to {actual_end_idx-1} (total: {actual_end_idx - start_idx})")
-    
-    # Use safe paragraph-by-paragraph copying to avoid XML corruption
-    return _extract_section_safe_copy(source_doc, start_idx, actual_end_idx)
-
-
-def _extract_section_safe_copy(source_doc: Document, start_idx: int, end_idx: int) -> Document:
-    """
-    Safe document extraction that preserves formatting without XML corruption.
-    
-    This method copies paragraphs, tables, and basic formatting while ensuring
-    the resulting document is valid and doesn't trigger Word warnings.
-    
-    Args:
-        source_doc: Source document
-        start_idx: Start paragraph index  
-        end_idx: End paragraph index
-        
-    Returns:
-        New document with safely copied content
-    """
-    
-    print(f"📋 Using safe copying for range {start_idx} to {end_idx-1}")
-    
-    # Create new document
-    new_doc = Document()
-
-    # TEMPORARILY DISABLED: Copy comprehensive document structure (causes process crash)
-    print("📋 Skipping document structure copying (debugging process crash)...")
-    # copy_document_structure(source_doc, new_doc)
-    # copy_headers_and_footers(source_doc, new_doc)
-    # copy_styles(source_doc, new_doc)
-
-    # Copy additional document-level settings safely
-    _copy_document_settings_safe(source_doc, new_doc)
-    
-    # Clear the default empty paragraph
-    if new_doc.paragraphs:
-        p = new_doc.paragraphs[0]
-        p.clear()
-    
-    # Track what we're copying
-    paragraphs_copied = 0
-    tables_copied = 0
-    
-    # Get both paragraphs and tables from the source document
-    source_elements = _get_document_elements_in_order(source_doc)
-    
-    # Filter elements to the target range
-    target_elements = []
-    current_para_idx = 0
-    
-    for element in source_elements:
-        if element['type'] == 'paragraph':
-            if start_idx <= current_para_idx < end_idx:
-                target_elements.append(element)
-            current_para_idx += 1
-        elif element['type'] == 'table':
-            # Include tables that fall within our range
-            if start_idx <= current_para_idx < end_idx:
-                target_elements.append(element)
-    
-    # TEMPORARILY REVERTING to safe functions to debug crash
-    print("📋 Using safe copying functions to isolate crash cause...")
-    for element in target_elements:
-        if element['type'] == 'paragraph':
-            copy_paragraph_safe(new_doc, element['content'])
-            paragraphs_copied += 1
-        elif element['type'] == 'table':
-            copy_table_safe(new_doc, element['content'])
-            tables_copied += 1
-    
-    print(f"✅ Safely copied {paragraphs_copied} paragraphs and {tables_copied} tables")
-    
-    return new_doc
-
-
-def _get_document_elements_in_order(doc: Document) -> List[Dict]:
-    """
-    Get all document elements (paragraphs and tables) in their order of appearance.
-    
-    Args:
-        doc: Source document
-        
-    Returns:
-        List of dictionaries with 'type' and 'content' keys
-    """
-    
-    elements = []
-    
-    # Add all paragraphs
-    for para in doc.paragraphs:
-        elements.append({
-            'type': 'paragraph',
-            'content': para
-        })
-    
-    # Note: Tables are embedded within the document structure
-    # For simplicity, we'll handle them as part of paragraph processing
-    # This avoids the complexity of XML order tracking
-    
-    return elements
-
-
-def copy_paragraph_safe(dest_doc: Document, source_para) -> None:
-    """
-    Safely copy a paragraph from source to destination document.
-    
-    This preserves basic formatting while avoiding XML corruption.
-    
-    Args:
-        dest_doc: Destination document
-        source_para: Source paragraph to copy
-    """
-    
-    # Create new paragraph
-    new_para = dest_doc.add_paragraph()
-    
-    # Copy paragraph-level properties safely
-    try:
-        new_para.style = source_para.style
-    except:
-        # If style copying fails, use default
-        pass
-    
-    try:
-        new_para.alignment = source_para.alignment
-    except:
-        pass
-    
-    # Copy runs with formatting
-    for run in source_para.runs:
-        new_run = new_para.add_run(run.text)
-        
-        # Copy basic formatting safely
-        try:
-            new_run.bold = run.bold
-            new_run.italic = run.italic
-            new_run.underline = run.underline
-        except:
-            # If formatting copying fails, continue with plain text
-            pass
-
-
-def copy_table_safe(dest_doc: Document, source_table) -> None:
-    """
-    Safely copy a table from source to destination document.
-    
-    Args:
-        dest_doc: Destination document
-        source_table: Source table to copy
-    """
-    
-    try:
-        # Get table dimensions
-        rows = len(source_table.rows)
-        cols = len(source_table.columns) if rows > 0 else 0
-        
-        if rows > 0 and cols > 0:
-            # Create new table
-            new_table = dest_doc.add_table(rows=rows, cols=cols)
-            
-            # Copy cell contents
-            for row_idx in range(rows):
-                for col_idx in range(cols):
-                    try:
-                        source_cell = source_table.cell(row_idx, col_idx)
-                        dest_cell = new_table.cell(row_idx, col_idx)
-                        dest_cell.text = source_cell.text
-                    except:
-                        # If cell copying fails, continue
-                        continue
-                        
-    except Exception as e:
-        print(f"⚠️  Warning: Could not copy table - {e}")
-
-
-def _copy_document_settings_safe(source_doc: Document, target_doc: Document) -> None:
-    """
-    Safely copy basic document settings without causing corruption.
-    
-    Args:
-        source_doc: Source document
-        target_doc: Target document
-    """
-    
-    try:
-        # Only copy very basic properties that are unlikely to cause issues
-        if hasattr(source_doc, 'core_properties') and hasattr(target_doc, 'core_properties'):
-            # Copy basic metadata only
-            target_doc.core_properties.author = source_doc.core_properties.author
-    except:
-        # If any copying fails, continue without it
-        pass
-
-
-def _copy_document_properties(source_doc: Document, target_doc: Document) -> None:
-    """
-    Copy document-level properties like styles, themes, etc.
-    
-    Args:
-        source_doc: Source document
-        target_doc: Target document to copy properties to
-    """
-    
-    # This function is kept for compatibility but now calls the safe version
-    _copy_document_settings_safe(source_doc, target_doc)
 
 
 def debug_three_header_structure(source_path: str, mapping_row: pd.Series) -> None:
@@ -2758,30 +2314,6 @@ def debug_three_header_structure(source_path: str, mapping_row: pd.Series) -> No
         print(f"\n❌ Cannot validate structure - missing header matches")
 
 
-def split_annexes_three_headers_with_fallback(source_path: str, output_dir: str, language: str, country: str, mapping_row: pd.Series) -> Tuple[str, str]:
-    """
-    Main splitting function with three-header approach and fallback to two-header method.
-    
-    This is the function you should call from your processor.py
-    """
-    
-    try:
-        # Try the three-header XML approach first
-        return split_annexes_three_headers_xml(source_path, output_dir, language, country, mapping_row)
-    
-    except ValueError as e:
-        print(f"⚠️  Three-header approach failed: {e}")
-        print(f"🔄 Falling back to two-header approach...")
-        
-        # Fall back to the enhanced two-header approach
-        return split_annexes_enhanced(source_path, output_dir, language, country, mapping_row)
-    
-    except Exception as e:
-        print(f"❌ XML approach failed with error: {e}")
-        print(f"🔄 Falling back to two-header approach...")
-        
-        # Fall back to the enhanced two-header approach
-        return split_annexes_enhanced(source_path, output_dir, language, country, mapping_row)
 
 def _is_header_match(paragraph_text: str, header_text: str) -> bool:
     """Check if a paragraph text matches a header with precise word-boundary matching."""
@@ -2922,29 +2454,6 @@ def _normalize_text_for_matching(text: str) -> str:
     
     return normalized
 
-def split_annexes_with_validation(source_path: str, output_dir: str, language: str, country: str, mapping_row: pd.Series) -> Tuple[str, str]:
-    """
-    Wrapper function that adds validation and error handling to the enhanced splitting logic.
-    
-    This function can be used as a drop-in replacement for the original split_annexes function.
-    """
-    
-    try:
-        return split_annexes_enhanced(source_path, output_dir, language, country, mapping_row)
-    
-    except ValueError as e:
-        print(f"❌ Validation error during splitting: {e}")
-        print(f"🔄 Falling back to original splitting method...")
-        
-        # Fallback to original method if enhanced method fails
-        return split_annexes_original(source_path, output_dir, language, country, mapping_row)
-    
-    except Exception as e:
-        print(f"❌ Unexpected error during enhanced splitting: {e}")
-        print(f"🔄 Falling back to original splitting method...")
-        
-        # Fallback to original method if enhanced method fails
-        return split_annexes_original(source_path, output_dir, language, country, mapping_row)
 
 
 def split_annexes_original(source_path: str, output_dir: str, language: str, country: str, mapping_row: pd.Series) -> Tuple[str, str]:
@@ -2990,56 +2499,6 @@ def split_annexes_original(source_path: str, output_dir: str, language: str, cou
     
     return annex_i_path, annex_iiib_path
 
-def test_three_header_approach(document_path: str, mapping_row: pd.Series):
-    """
-    Test the three-header approach on a document.
-    """
-    
-    print(f"🧪 TESTING THREE-HEADER APPROACH")
-    print(f"Document: {document_path}")
-    
-    # First debug the structure
-    debug_three_header_structure(document_path, mapping_row)
-    
-    # Then try the actual splitting
-    try:
-        print(f"\n" + "="*80)
-        print(f"TESTING THREE-HEADER SPLITTING:")
-        
-        temp_output = Path(document_path).parent / "temp_three_header_test"
-        temp_output.mkdir(exist_ok=True)
-        
-        result = split_annexes_three_headers_xml(
-            document_path,
-            str(temp_output),
-            mapping_row.get('Language', 'Unknown'),
-            mapping_row.get('Country', 'Unknown'),
-            mapping_row
-        )
-        
-        print(f"✅ Three-header splitting completed successfully!")
-        print(f"   Annex I: {result[0]}")
-        print(f"   Annex IIIB: {result[1]}")
-        
-        # Validate output files
-        for file_path, name in [(result[0], "Annex I"), (result[1], "Annex IIIB")]:
-            if Path(file_path).exists():
-                doc = Document(file_path)
-                print(f"   {name}: {len(doc.paragraphs)} paragraphs")
-                
-                # Check if document has content
-                content_length = sum(len(p.text) for p in doc.paragraphs)
-                if content_length == 0:
-                    print(f"   ❌ {name} is empty!")
-                elif content_length < 100:
-                    print(f"   ⚠️  {name} is very short ({content_length} characters)")
-                else:
-                    print(f"   ✅ {name} has substantial content ({content_length} characters)")
-        
-    except Exception as e:
-        print(f"❌ Three-header splitting failed: {e}")
-        import traceback
-        traceback.print_exc()
 # ============================================================================= 
 # ENHANCED PROCESSOR CLASSES
 # =============================================================================
@@ -3204,11 +2663,20 @@ class DocumentProcessor:
                         document_path, mapping_df, file_manager, split_dir, pdf_dir, mapping_path
                     )
                     output_files.extend(result.output_files)
-                    
+
                 except Exception as e:
                     self.logger.error(f"Error processing {document_path.name}: {e}")
                     self.stats.errors_encountered += 1
-            
+
+            # NEW: Batch convert PDFs after all document processing
+            if self.config.convert_to_pdf and not self.config.skip_pdf_in_background:
+                pdf_files = self._batch_convert_pdfs(pdf_dir)
+                output_files.extend(pdf_files)
+                self.stats.output_files_created += len(pdf_files)
+            elif self.config.convert_to_pdf and self.config.skip_pdf_in_background:
+                self.logger.info("📄 PDF conversion skipped (running in background context)")
+                self.logger.info(f"📄 {len(getattr(self, '_pending_pdf_conversions', []))} documents queued for manual PDF conversion")
+
             # Generate final report
             return self._generate_final_result(output_files)
             
@@ -3415,40 +2883,13 @@ class DocumentProcessor:
             output_files.extend([annex_i_path, annex_iiib_path])
             self.logger.info(f"✅ Split completed")
             
-            # Convert to PDF if enabled
+            # Store paths for later PDF conversion (don't convert yet)
             if self.config.convert_to_pdf:
-                try:
-                    self.logger.info("📄 Converting to PDF...")
-                    
-                    # Try converting Annex I
-                    try:
-                        pdf_annex_i = convert_to_pdf(annex_i_path, str(pdf_dir))
-                        output_files.append(pdf_annex_i)
-                        self.logger.info(f"✅ Annex I PDF: {Path(pdf_annex_i).name}")
-                    except Exception as e:
-                        self.logger.warning(f"⚠️ Annex I PDF conversion failed: {e}")
-
-                    # RESOURCE CLEANUP between conversions to prevent crashes
-                    import gc
-                    import time
-                    self.logger.info("🧹 Cleaning up resources between PDF conversions...")
-                    gc.collect()  # Force garbage collection
-                    await asyncio.sleep(0.5) # Reduced to minimal delay - just enough for resource cleanup
-
-                    # Try converting Annex IIIB
-                    try:
-                        self.logger.info("🔄 Starting Annex IIIB PDF conversion...")
-                        pdf_annex_iiib = convert_to_pdf(annex_iiib_path, str(pdf_dir))
-                        output_files.append(pdf_annex_iiib)
-                        self.logger.info(f"✅ Annex IIIB PDF: {Path(pdf_annex_iiib).name}")
-                    except Exception as e:
-                        self.logger.warning(f"⚠️ Annex IIIB PDF conversion failed: {e}")
-                    
-                    self.logger.info("📄 PDF conversion phase completed")
-                    
-                except Exception as e:
-                    self.logger.warning(f"⚠️ PDF conversion setup failed: {e}")
-                    # Continue processing - PDF conversion is not critical
+                if not hasattr(self, '_pending_pdf_conversions'):
+                    self._pending_pdf_conversions = []
+                self._pending_pdf_conversions.append((annex_i_path, str(pdf_dir)))
+                self._pending_pdf_conversions.append((annex_iiib_path, str(pdf_dir)))
+                self.logger.info(f"📄 Queued 2 documents for batch PDF conversion")
             
             self.stats.output_files_created += len(output_files)
             
@@ -3460,7 +2901,37 @@ class DocumentProcessor:
             
         except Exception as e:
             raise DocumentError(f"Failed to save and split document: {e}")
-    
+
+    def _batch_convert_pdfs(self, pdf_dir: Path) -> List[str]:
+        """Convert all pending Word documents to PDF after main processing."""
+        if not hasattr(self, '_pending_pdf_conversions') or not self._pending_pdf_conversions:
+            return []
+
+        self.logger.info("=" * 80)
+        self.logger.info(f"📄 Starting batch PDF conversion for {len(self._pending_pdf_conversions)} documents...")
+        self.logger.info("=" * 80)
+
+        pdf_files = []
+        successful = 0
+        failed = 0
+
+        for idx, (doc_path, output_dir) in enumerate(self._pending_pdf_conversions, 1):
+            self.logger.info(f"🔄 Converting {idx}/{len(self._pending_pdf_conversions)}: {Path(doc_path).name}")
+            try:
+                pdf_path = convert_to_pdf(doc_path, output_dir)
+                pdf_files.append(pdf_path)
+                successful += 1
+                self.logger.info(f"✅ Success: {Path(pdf_path).name}")
+            except Exception as e:
+                failed += 1
+                self.logger.warning(f"❌ Failed: {Path(doc_path).name} - {e}")
+
+        self.logger.info("=" * 80)
+        self.logger.info(f"📄 Batch PDF conversion complete: {successful} successful, {failed} failed")
+        self.logger.info("=" * 80)
+
+        return pdf_files
+
     def _generate_final_result(self, output_files: List[str]) -> ProcessingResult:
         """Generate final processing result with statistics."""
         
@@ -3480,10 +2951,14 @@ class DocumentProcessor:
         success = self.stats.variants_successful > 0
         message = f"Processed {self.stats.variants_successful}/{self.stats.variants_processed} variants successfully"
         
+        # Get pending PDF conversions if they exist
+        pending_conversions = getattr(self, '_pending_pdf_conversions', [])
+
         return ProcessingResult(
             success=success,
             message=message,
-            output_files=output_files
+            output_files=output_files,
+            pending_pdf_conversions=pending_conversions
         )
 
 # ============================================================================= 
