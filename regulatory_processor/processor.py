@@ -22,6 +22,7 @@ import logging
 import locale
 import calendar
 import asyncio
+import unicodedata
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, NamedTuple, Union
 from dataclasses import dataclass
@@ -1749,56 +1750,81 @@ def create_pl_replacement_block(mapping_row: pd.Series, country_delimiter: str =
 def _find_section_10_header(doc: Document, date_header: str) -> Optional[int]:
     """
     Find the paragraph index containing the Section 10 header.
-
-    Uses the language-specific date_header from the mapping file to identify
-    the correct Section 10 header paragraph.
-
-    Args:
-        doc: Document object
-        date_header: Language-specific header text from mapping file
-                    (e.g., 'Annex I Date Text' column)
-
-    Returns:
-        int: Paragraph index if found, None otherwise
+    
+    Handles both formats:
+    - "10. HEADER TEXT" (section number and header in same paragraph)
+    - "HEADER TEXT" (header in separate paragraph after "10.")
     """
-    date_header_lower = date_header.lower().strip()
-
-    # Store potential matches with scores for better selection
-    potential_matches = []
-
+    def normalize_text(text: str) -> str:
+        """Normalize text for comparison."""
+        normalized = unicodedata.normalize('NFKD', text)
+        normalized = normalized.lower().strip()
+        normalized = ' '.join(normalized.split())
+        return normalized
+    
+    def get_full_paragraph_text(para) -> str:
+        """Extract complete text from paragraph including all runs."""
+        full_text = ''.join(run.text for run in para.runs)
+        if not full_text.strip():
+            full_text = para.text
+        return full_text.strip()
+    
+    date_header_normalized = normalize_text(date_header)
+    print(f"🔍 DEBUG: Looking for normalized header: '{date_header_normalized}'")
+    
+    # FIRST PASS: Look for exact header match (regardless of "10" presence)
+    # This handles cases where the header text is in a separate paragraph
     for idx, para in enumerate(doc.paragraphs):
-        text = para.text.strip()
-        text_lower = text.lower()
-
-        # Primary approach: Look for paragraph that contains the exact
-        # language-specific date header from the mapping file
-        if date_header_lower in text_lower:
-            # Additional validation: should also contain "10" to confirm it's Section 10
-            if '10' in text_lower:
-                print(f"✅ Found Section 10 header (exact match) at paragraph {idx}: '{text[:80]}...'")
-                return idx  # Exact match - return immediately
-
-        # Secondary approach: Look for section number pattern + length validation
-        # This handles cases where the header might be slightly different
-        if '10.' in text_lower:
-            # Must be at start of text or after whitespace (proper section header)
-            if text_lower.startswith('10.') or ' 10.' in text_lower:
-                # Must be substantial content (not just "10." alone)
-                if len(text_lower) > 15:  # More restrictive length requirement
-                    # Additional validation: should contain date-related keywords
-                    date_keywords = ['date', 'first', 'authorisation', 'authorization', 'renewal', 'fecha', 'première', 'première']
-                    if any(keyword in text_lower for keyword in date_keywords):
-                        score = len(text_lower)  # Longer headers get higher priority
-                        potential_matches.append((idx, score, text))
-
-    # If we have potential matches, return the one with highest score (longest text)
-    if potential_matches:
-        best_match = max(potential_matches, key=lambda x: x[1])
-        idx, score, text = best_match
-        print(f"✅ Found Section 10 header (pattern match) at paragraph {idx}: '{text[:80]}...'")
-        return idx
-
-    print(f"❌ Could not find Section 10 header with text: '{date_header}'")
+        text = get_full_paragraph_text(para)
+        if not text:
+            continue
+        
+        text_normalized = normalize_text(text)
+        
+        # Exact match of the date header
+        if date_header_normalized == text_normalized:
+            # Check if previous paragraph contains "10." to confirm it's Section 10
+            if idx > 0:
+                prev_text = get_full_paragraph_text(doc.paragraphs[idx - 1])
+                if '10' in prev_text.lower():
+                    print(f"✅ Found Section 10 header at paragraph {idx} (header after section number)")
+                    print(f"   Previous para {idx-1}: '{prev_text}'")
+                    print(f"   Header para {idx}: '{text}'")
+                    return idx
+            
+            # Even if previous doesn't have "10", if it's an exact match, it's probably right
+            print(f"✅ Found Section 10 header at paragraph {idx} (exact match)")
+            print(f"   Text: '{text}'")
+            return idx
+        
+        # Fuzzy match for the header text alone
+        if len(text_normalized) < 100:  # Headers are usually short
+            date_words = set(date_header_normalized.split())
+            text_words = set(text_normalized.split())
+            
+            if len(date_words) > 0:
+                match_ratio = len(date_words & text_words) / len(date_words)
+                if match_ratio >= 0.8:  # High threshold for non-"10" matches
+                    print(f"✅ Found Section 10 header at paragraph {idx} (fuzzy match {match_ratio:.0%})")
+                    print(f"   Text: '{text}'")
+                    return idx
+    
+    # SECOND PASS: Look for "10." combined with header text in same paragraph
+    # This is the traditional format
+    for idx, para in enumerate(doc.paragraphs):
+        text = get_full_paragraph_text(para)
+        if not text or '10' not in text:
+            continue
+        
+        text_normalized = normalize_text(text)
+        
+        if '10.' in text_normalized and date_header_normalized in text_normalized:
+            print(f"✅ Found Section 10 header at paragraph {idx} (combined format)")
+            print(f"   Text: '{text}'")
+            return idx
+    
+    print(f"❌ Could not find Section 10 header")
+    print(f"   Searched {len(doc.paragraphs)} paragraphs")
     return None
 
 
@@ -1861,7 +1887,7 @@ def update_section_10_date(doc: Document, mapping_row: pd.Series, mapping_file_p
     3. Inserts the formatted date in the next paragraph after the header
     """
     country = mapping_row.get('Country', '')
-    date_header = mapping_row.get('Annex I Date Text', 'Date of first authorisation/renewal of the authorisation')
+    date_header = mapping_row.get('Annex I Date Header', 'Date of first authorisation/renewal of the authorisation')
 
     print(f"🔧 DEBUG: update_section_10_date called for {country}")
     print(f"   Date header text: '{date_header}'")

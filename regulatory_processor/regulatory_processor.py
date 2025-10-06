@@ -99,13 +99,21 @@ class AppState(rx.State):
             )
 
             # PDF conversion happens HERE - outside the executor
+            print(f"🔍 DEBUG: result.success = {result.success}")
+            print(f"🔍 DEBUG: result.pending_pdf_conversions = {result.pending_pdf_conversions}")
+            print(f"🔍 DEBUG: len(result.pending_pdf_conversions) = {len(result.pending_pdf_conversions) if result.pending_pdf_conversions else 0}")
+
             if result.success and result.pending_pdf_conversions:
+                print(f"🔄 DEBUG: Starting PDF conversion for {len(result.pending_pdf_conversions)} documents")
                 async with self:
                     self.status = f"Converting {len(result.pending_pdf_conversions)} documents to PDF..."
 
                 # Run conversions outside executor context
                 pdf_results = await self._convert_pdfs_outside_executor(result.pending_pdf_conversions)
                 result.output_files.extend(pdf_results)
+                print(f"✅ DEBUG: PDF conversion completed - {len(pdf_results)} PDFs created")
+            else:
+                print(f"⚠️ DEBUG: PDF conversion skipped - success: {result.success}, pending: {bool(result.pending_pdf_conversions)}")
 
         except Exception as e:
             # If the processor crashes, create an error result to show the user
