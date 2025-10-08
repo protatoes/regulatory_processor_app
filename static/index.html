@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EU Regulatory Document Processor</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🏥 EU Regulatory Document Processor</h1>
+            <p class="subtitle">Process SmPC documents with automatic splitting and formatting</p>
+        </header>
+        
+        <main>
+            <form id="processForm" enctype="multipart/form-data">
+                <div class="form-group">
+                    <label for="folderPath">
+                        📁 Document Folder Path:
+                        <span class="help-text">Absolute path to folder containing combined SmPC Word files</span>
+                    </label>
+                    <input type="text" 
+                           id="folderPath" 
+                           name="folder_path" 
+                           placeholder="/Users/username/Documents/smpc_files" 
+                           required>
+                </div>
+                
+                <div class="form-group">
+                    <label for="mappingFile">
+                        📊 Excel Mapping File:
+                        <span class="help-text">Upload the mapping configuration file (.xlsx or .xls)</span>
+                    </label>
+                    <input type="file" 
+                           id="mappingFile" 
+                           name="mapping_file" 
+                           accept=".xlsx,.xls" 
+                           required>
+                    <div class="file-info" id="fileInfo" style="display: none;"></div>
+                </div>
+                
+                <button type="submit" id="submitBtn" class="submit-btn">
+                    <span id="submitText">🚀 Start Processing</span>
+                    <div id="submitSpinner" class="spinner" style="display: none;"></div>
+                </button>
+            </form>
+            
+            <div id="status" class="status-section" style="display: none;">
+                <div class="status-header">
+                    <h3>Processing Status</h3>
+                    <span id="statusBadge" class="status-badge">Processing</span>
+                </div>
+                
+                <div id="statusMessage" class="status-message">Ready to process...</div>
+                
+                <div class="progress-container">
+                    <div id="progressBar" class="progress-bar">
+                        <div id="progressFill" class="progress-fill"></div>
+                    </div>
+                    <span id="progressText" class="progress-text">0%</span>
+                </div>
+                
+                <div id="results" class="results-section" style="display: none;">
+                    <div id="fileList" class="file-list"></div>
+                    <div id="errorList" class="error-list"></div>
+                </div>
+            </div>
+        </main>
+        
+        <footer>
+            <p>💡 <strong>Tip:</strong> Processing may take several minutes depending on document size and complexity.</p>
+        </footer>
+    </div>
+    
+    <script src="/static/app.js"></script>
+</body>
+</html>
