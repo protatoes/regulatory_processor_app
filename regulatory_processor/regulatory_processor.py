@@ -11,11 +11,15 @@ documents. Progress is reported via a status field on the page.
 
 import os
 import asyncio
+import tempfile
+import shutil
 from functools import partial
+from pathlib import Path
 import reflex as rx
 
 # Import the processor module and its necessary classes
 from . import processor
+from .config import ProcessingConfig
 
 class AppState(rx.State):
     """
@@ -61,103 +65,177 @@ class AppState(rx.State):
 
     # ### PART 2: THE BACKGROUND TASK ###
     # Decorated with @rx.event(background=True), this runs on a separate thread.
-    # It contains the slow, blocking call to your processor.
+    # Uses existing tested processor with simple incremental processing.
     @rx.event(background=True)
     async def run_processing_background(self) -> None:
         """
-        Runs the heavy document processing logic in the background.
-        This function does not block the main app thread and yields control
-        to the Reflex event loop using asyncio.run_in_executor.
+        Simple incremental processing - one document at a time using existing processor.
+        Yields control between documents to prevent worker timeouts.
         """
-        # Use 'async with self' to get a clean instance of the state
         async with self:
             folder = os.path.expanduser(self.folder_path.strip())
             mapping = os.path.expanduser(self.mapping_path.strip())
 
-        # Update status to show we're starting
+        # Validate inputs
+        if not os.path.isdir(folder):
+            async with self:
+                self.status = "❌ Error: Invalid folder path"
+                self.is_processing = False
+            return
+
+        if not os.path.isfile(mapping):
+            async with self:
+                self.status = "❌ Error: Invalid mapping file"
+                self.is_processing = False
+            return
+
         async with self:
-            self.status = "Initializing document processing..."
+            self.status = "🔍 Discovering documents..."
 
         try:
-            # Create processing configuration - skip PDF conversion in executor
-            config = processor.ProcessingConfig(
-                create_backups=True,
-                convert_to_pdf=True,
-                skip_pdf_in_background=True,  # Skip PDF to avoid ThreadPoolExecutor deadlock
-                log_level="INFO"
-            )
+            # Document discovery
+            docs_folder = Path(folder)
+            documents = [
+                f for f in docs_folder.iterdir()
+                if f.suffix.lower() == '.docx'
+                and not f.name.startswith('~')
+                and 'Annex' not in f.name
+            ]
 
-            # Update status before starting main processing
-            async with self:
-                self.status = "Processing documents (this may take several minutes)..."
-
-            # Run document processing in executor (no PDF conversion happens here)
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,  # Use default ThreadPoolExecutor
-                partial(processor.process_folder_enhanced, folder, mapping, config)
-            )
-
-            # PDF conversion happens HERE - outside the executor
-            print(f"🔍 DEBUG: result.success = {result.success}")
-            print(f"🔍 DEBUG: result.pending_pdf_conversions = {result.pending_pdf_conversions}")
-            print(f"🔍 DEBUG: len(result.pending_pdf_conversions) = {len(result.pending_pdf_conversions) if result.pending_pdf_conversions else 0}")
-
-            if result.success and result.pending_pdf_conversions:
-                print(f"🔄 DEBUG: Starting PDF conversion for {len(result.pending_pdf_conversions)} documents")
+            if not documents:
                 async with self:
-                    self.status = f"Converting {len(result.pending_pdf_conversions)} documents to PDF..."
+                    self.status = "❌ No valid documents found"
+                    self.is_processing = False
+                return
 
-                # Run conversions outside executor context
-                pdf_results = await self._convert_pdfs_outside_executor(result.pending_pdf_conversions)
-                result.output_files.extend(pdf_results)
-                print(f"✅ DEBUG: PDF conversion completed - {len(pdf_results)} PDFs created")
-            else:
-                print(f"⚠️ DEBUG: PDF conversion skipped - success: {result.success}, pending: {bool(result.pending_pdf_conversions)}")
+            async with self:
+                self.status = f"📄 Found {len(documents)} document(s). Starting processing..."
+
+            # Process each document using existing processor
+            total_docs = len(documents)
+            successful = 0
+            all_output_files = []
+
+            for idx, doc_path in enumerate(documents, 1):
+                async with self:
+                    self.status = f"📝 Processing document {idx}/{total_docs}: {doc_path.name}..."
+
+                try:
+                    # Process entire document in one executor call using existing processor
+                    loop = asyncio.get_event_loop()
+                    result = await loop.run_in_executor(
+                        None,
+                        self._process_single_document,
+                        str(doc_path),
+                        mapping,
+                        folder
+                    )
+
+                    if result.success:
+                        successful += 1
+                        all_output_files.extend(result.output_files)
+                        async with self:
+                            self.status = f"✅ Document {idx}/{total_docs} completed: {len(result.output_files)} files created"
+                    else:
+                        async with self:
+                            self.status = f"⚠️ Document {idx}/{total_docs} failed: {result.message}"
+
+                except Exception as e:
+                    async with self:
+                        self.status = f"❌ Error processing {doc_path.name}: {str(e)}"
+                    print(f"Error processing {doc_path.name}: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+                # Yield control to prevent worker timeout
+                await asyncio.sleep(0.1)
+
+            # Final status
+            async with self:
+                self.is_processing = False
+                if successful == total_docs:
+                    self.status = f"✅ All {total_docs} document(s) processed successfully! Created {len(all_output_files)} files."
+                elif successful > 0:
+                    self.status = f"⚠️ Processed {successful}/{total_docs} document(s) successfully. Created {len(all_output_files)} files."
+                else:
+                    self.status = f"❌ Processing failed for all {total_docs} document(s)."
 
         except Exception as e:
-            # If the processor crashes, create an error result to show the user
-            result = processor.ProcessingResult(
+            async with self:
+                self.is_processing = False
+                self.status = f"❌ Fatal error: {str(e)}"
+            print(f"Fatal error: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _process_single_document(self, doc_path: str, mapping_path: str, base_folder: str) -> processor.ProcessingResult:
+        """
+        Process one complete document using existing tested processor code.
+        This function runs in the executor thread and uses existing processor logic.
+        """
+        try:
+            # Create a temporary folder for processing this single document
+            import tempfile
+            import shutil
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # Copy document to temp directory
+                temp_doc_path = os.path.join(temp_dir, os.path.basename(doc_path))
+                shutil.copy2(doc_path, temp_doc_path)
+
+                # Configure processor to skip PDF conversion in background to avoid issues
+                config = ProcessingConfig(
+                    convert_to_pdf=False,  # Skip PDF conversion to avoid LibreOffice issues in background
+                    skip_pdf_in_background=True,
+                )
+
+                # Process using existing tested processor code
+                result = processor.process_folder_enhanced(temp_dir, mapping_path, config)
+
+                if result.success and result.output_files:
+                    # Move output files to final location
+                    final_output_files = []
+
+                    # Create output directories in base folder
+                    base_path = Path(base_folder)
+                    split_dir = base_path / 'split_docs'
+                    split_dir.mkdir(exist_ok=True)
+
+                    for temp_file in result.output_files:
+                        if os.path.exists(temp_file):
+                            # Determine final location based on file type
+                            file_name = os.path.basename(temp_file)
+
+                            if 'Annex I' in file_name or 'Annex IIIB' in file_name:
+                                # Split documents go to split_docs folder
+                                final_path = split_dir / file_name
+                            else:
+                                # Combined documents go to base folder
+                                final_path = base_path / file_name
+
+                            # Copy to final location
+                            shutil.copy2(temp_file, str(final_path))
+                            final_output_files.append(str(final_path))
+
+                    return processor.ProcessingResult(
+                        success=True,
+                        message=f"Successfully processed {os.path.basename(doc_path)}",
+                        output_files=final_output_files
+                    )
+                else:
+                    return processor.ProcessingResult(
+                        success=False,
+                        message=f"Processing failed for {os.path.basename(doc_path)}: {result.message}",
+                        errors=result.errors if hasattr(result, 'errors') else []
+                    )
+
+        except Exception as e:
+            return processor.ProcessingResult(
                 success=False,
-                message="A fatal error occurred during processing.",
+                message=f"Error processing {os.path.basename(doc_path)}: {str(e)}",
                 errors=[str(e)]
             )
 
-        # Update state directly in the background task - no need to yield to another handler
-        async with self:
-            self.is_processing = False
-            if result.success:
-                output_count = len(result.output_files)
-                pdf_count = len([f for f in result.output_files if f.endswith('.pdf')])
-                self.status = (
-                    f"✅ Processing completed successfully! "
-                    f"Created {output_count} files ({pdf_count} PDFs)."
-                )
-            else:
-                self.status = f"❌ Processing failed: {result.message}"
-                if result.errors:
-                    error_summary = "; ".join(result.errors[:2])
-                    self.status += f" Details: {error_summary}"
-
-    async def _convert_pdfs_outside_executor(self, conversions) -> list:
-        """Run PDF conversions outside executor in async context."""
-        pdf_files = []
-
-        for doc_path, output_dir in conversions:
-            # Run in executor but as individual calls, not nested inside document processing
-            loop = asyncio.get_event_loop()
-            try:
-                pdf_path = await loop.run_in_executor(
-                    None,
-                    processor.convert_to_pdf,
-                    doc_path,
-                    output_dir
-                )
-                pdf_files.append(pdf_path)
-            except Exception as e:
-                print(f"PDF conversion failed for {doc_path}: {e}")
-
-        return pdf_files
 
 def index() -> rx.Component:
     """The main user interface for the document processor."""

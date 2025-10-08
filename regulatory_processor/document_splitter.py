@@ -63,12 +63,18 @@ def clone_and_split_document(
         annex_ii_header = mapping_row.get('Annex II Header in country language', '').strip()
         annex_iiib_header = mapping_row.get('Annex IIIB Header in country language', '').strip()
 
+        print(f"🗂️ MAPPING HEADERS EXTRACTED:")
+        print(f"   Annex I: '{annex_i_header}'")
+        print(f"   Annex II: '{annex_ii_header}'")
+        print(f"   Annex IIIB: '{annex_iiib_header}'")
+
         # Add non-empty headers to the list
         for header in [annex_i_header, annex_ii_header, annex_iiib_header]:
             if header:
                 all_annex_headers.append(header)
+                logger.info(f"   ✅ Added to all_annex_headers: '{header}'")
 
-        logger.debug(f"📋 Extracted annex headers from mapping: {all_annex_headers}")
+        logger.info(f"📋 Final all_annex_headers list: {all_annex_headers}")
 
     result_paths = {}
 
@@ -85,14 +91,34 @@ def clone_and_split_document(
             is_annex_i = (mapping_row is not None and
                          annex == mapping_row.get('Annex I Header in country language', '').strip())
 
+            print(f"🧪 PROCESSING ANNEX: '{annex}'")
+            print(f"   Is Annex I: {is_annex_i}")
+            print(f"   Annex I header from mapping: '{mapping_row.get('Annex I Header in country language', '').strip()}'")
+
             # Prune to target annex
-            success = prune_to_annex(output_path, annex, all_annex_headers, is_annex_i)
+            print(f"🔧 Starting pruning process for {annex}")
+
+            # OPTIMIZATION: Find boundaries once and pass them to avoid duplicate processing
+            print(f"🔧 Pre-calculating boundaries to avoid duplicate work...")
+            temp_doc = Document(output_path)
+            start_idx, end_idx = find_annex_boundaries(temp_doc, annex, all_annex_headers, is_annex_i, mapping_row)
+            print(f"🔧 Pre-calculated boundaries: start={start_idx}, end={end_idx}")
+
+            success = prune_to_annex_with_boundaries(output_path, annex, start_idx, end_idx)
+            print(f"🔧 Pruning result for {annex}: {'SUCCESS' if success else 'FAILED'}")
 
             if success:
                 result_paths[annex] = output_path
-                logger.info(f"✅ Successfully created {annex} document: {output_path}")
+                print(f"✅ Successfully created {annex} document: {output_path}")
+
+                # Verify the pruned document
+                try:
+                    verify_doc = Document(output_path)
+                    print(f"   📊 Verification: Document has {len(verify_doc.paragraphs)} paragraphs")
+                except Exception as e:
+                    print(f"   ⚠️ Could not verify document: {e}")
             else:
-                logger.error(f"❌ Failed to prune {annex} from {output_path}")
+                print(f"❌ Failed to prune {annex} from {output_path}")
 
         except Exception as e:
             logger.error(f"❌ Error processing {annex}: {e}")
@@ -129,7 +155,7 @@ def clone_source_document(source_path: str, output_path: str) -> str:
     return output_path
 
 
-def find_annex_boundaries(doc: Document, target_annex: str, all_annex_headers: List[str] = None, is_annex_i: bool = False) -> Tuple[Optional[int], Optional[int]]:
+def find_annex_boundaries(doc: Document, target_annex: str, all_annex_headers: List[str] = None, is_annex_i: bool = False, mapping_row = None) -> Tuple[Optional[int], Optional[int]]:
     """
     Find the start and end paragraph indices for a specific annex.
     Handles proper annex boundary detection to avoid partial matches.
@@ -146,10 +172,13 @@ def find_annex_boundaries(doc: Document, target_annex: str, all_annex_headers: L
     Note:
         - Uses strict matching to avoid "ANNEX I" matching "ANNEX III"
         - For Annex I: starts from paragraph 0 to preserve title pages and intro content
-        - For other annexes: starts from their header location
+        - For Annex I boundaries: prioritizes Annex II, uses Annex IIIB only as fallback
+        - For other annexes: starts from their header location, uses all headers for boundaries
         - If no end marker found, assumes annex extends to document end
     """
-    logger.debug(f"🔍 Finding boundaries for {target_annex}")
+    print(f"🔍 FINDING BOUNDARIES FOR: '{target_annex}'")
+    print(f"🎯 is_annex_i: {is_annex_i}")
+    print(f"📄 Document has {len(doc.paragraphs)} paragraphs")
 
     start_idx = None
     end_idx = None
@@ -160,13 +189,61 @@ def find_annex_boundaries(doc: Document, target_annex: str, all_annex_headers: L
         return text.upper().strip().replace('\xa0', ' ').replace('\u00a0', ' ')
 
     target_upper = normalize_text(target_annex)
+    logger.info(f"🎯 Normalized target: '{target_upper}'")
 
     # Special case: For Annex I, start from beginning of document (paragraph 0)
     # This preserves title pages and introductory content
     if is_annex_i:
         start_idx = 0
-        logger.debug(f"📍 Annex I detected - starting from document beginning (paragraph 0)")
+        logger.info(f"📍 Annex I detected - starting from document beginning (paragraph 0)")
 
+    # First pass: log all annex-related paragraphs for debugging (REDUCED for performance)
+    print("🔍 SCANNING DOCUMENT FOR ANNEX HEADERS...")
+    annex_paragraphs = []
+    for i, para in enumerate(doc.paragraphs):
+        para_text = normalize_text(para.text)
+        if "ANNEX" in para_text or "ANEXO" in para_text:
+            annex_paragraphs.append((i, para.text.strip(), para_text))
+
+    # Only show the annex headers, not all the debug text
+    for i, para_text, normalized in annex_paragraphs:
+        print(f"   Para {i}: '{para_text}'")
+
+    if not annex_paragraphs:
+        print("   ⚠️ NO ANNEX HEADERS FOUND IN DOCUMENT!")
+    else:
+        print(f"   📋 Found {len(annex_paragraphs)} annex-related paragraphs")
+
+    # Define priority headers ONCE before the main loop
+    if is_annex_i:
+        # For Annex I: prioritize Annex II by explicitly finding it in mapping_row
+        priority_headers = []
+        if mapping_row is not None:
+            # Get Annex II header directly from mapping row (not by array index!)
+            explicit_annex_ii = mapping_row.get('Annex II Header in country language', '').strip()
+            if explicit_annex_ii:
+                priority_headers.append(explicit_annex_ii)
+                print(f"✅ Added Annex II as priority boundary: '{explicit_annex_ii}'")
+            else:
+                print(f"⚠️ No Annex II header found in mapping")
+
+            # Add Annex IIIB as fallback
+            explicit_annex_iiib = mapping_row.get('Annex IIIB Header in country language', '').strip()
+            if explicit_annex_iiib:
+                priority_headers.append(explicit_annex_iiib)
+                print(f"✅ Added Annex IIIB as fallback boundary: '{explicit_annex_iiib}'")
+            else:
+                print(f"⚠️ No Annex IIIB header found in mapping")
+        else:
+            # Fallback: use all headers if no mapping_row
+            priority_headers = all_annex_headers
+        print(f"🎯 Annex I boundary priority: {priority_headers}")
+    else:
+        # For other annexes: use all headers as before
+        priority_headers = all_annex_headers
+        print(f"🎯 {target_annex} boundary headers: {priority_headers}")
+
+    # Main processing loop
     for i, para in enumerate(doc.paragraphs):
         para_text = normalize_text(para.text)
 
@@ -179,22 +256,38 @@ def find_annex_boundaries(doc: Document, target_annex: str, all_annex_headers: L
                 logger.debug(f"📍 Found {target_annex} start at paragraph {i}: '{para.text[:50]}...'")
                 continue
 
-        # Found next annex (end of current annex) - use mapping file headers
+        # Found next annex (end of current annex) - use mapping file headers with proper sequencing
         if start_idx is not None:
             if all_annex_headers is None:
                 raise ValueError("all_annex_headers parameter is required for proper annex boundary detection")
 
-            # Check if this paragraph starts any known annex header
-            for header in all_annex_headers:
+            # Check if this paragraph starts any prioritized annex header
+            for header in priority_headers:
                 header_upper = normalize_text(header)
+                # Simplified logging for performance - only log boundary matches
+                if "ANNEX" in para_text or "ANEXO" in para_text:
+                    if para_text.startswith(header_upper):
+                        print(f"🔍 Para {i}: MATCH '{para.text.strip()}' vs '{header}'")
+
                 if para_text.startswith(header_upper):
                     # Make sure it's not the same annex continuing
-                    if not para_text.startswith(target_upper):
+                    # FIXED: Use exact match to avoid substring issues (e.g., "ANEXO II" vs "ANEXO I")
+                    if para_text != target_upper and not para_text.startswith(target_upper + " "):
                         end_idx = i
-                        logger.debug(f"🔚 Found {target_annex} end at paragraph {i}: '{para.text[:50]}...'")
+                        print(f"🔚 BOUNDARY FOUND! {target_annex} ends at paragraph {i}: '{para.text[:100]}...' (boundary: {header})")
                         break
+                    else:
+                        logger.debug(f"⚠️ Skipped same annex match: '{para.text[:50]}...'")
+                else:
+                    logger.debug(f"❌ No match for '{header}' in: '{para.text[:50]}...'")
 
+                # Also log the exact text comparison for debugging
+                if i % 10 == 0:  # Log every 10th paragraph to avoid spam
+                    logger.debug(f"�� Para {i} normalized: '{para_text[:50]}...' vs header: '{header_upper}'")
+
+            # Exit early if boundary found
             if end_idx is not None:
+                logger.info(f"🎯 Boundary found for {target_annex}, stopping search at paragraph {end_idx}")
                 break
 
     # If no end found, assume it goes to document end
@@ -205,7 +298,109 @@ def find_annex_boundaries(doc: Document, target_annex: str, all_annex_headers: L
     return start_idx, end_idx
 
 
-def prune_to_annex(doc_path: str, target_annex: str, all_annex_headers: List[str] = None, is_annex_i: bool = False) -> bool:
+def prune_to_annex_with_boundaries(doc_path: str, target_annex: str, start_idx: int, end_idx: int = None) -> bool:
+    """
+    Remove all content except the target annex from the document using pre-calculated boundaries.
+    This avoids duplicate boundary calculation and improves performance.
+
+    Args:
+        doc_path: Path to document to prune
+        target_annex: Annex name for logging
+        start_idx: Start paragraph index
+        end_idx: End paragraph index (None means to document end)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        print(f"✂️ PRUNING DOCUMENT to keep only {target_annex}")
+        print(f"   Document path: {doc_path}")
+        print(f"   Using pre-calculated boundaries: start={start_idx}, end={end_idx}")
+
+        import time
+        start_time = time.time()
+
+        doc = Document(doc_path)
+        print(f"   Loaded document with {len(doc.paragraphs)} paragraphs")
+        print(f"   ⏱️ Document load time: {time.time() - start_time:.2f}s")
+
+        if start_idx is None:
+            print(f"❌ Invalid start index for {target_annex}")
+            return False
+
+        # Build a set of paragraph elements that should be KEPT
+        keep_paragraph_elements = set()
+        for idx in range(start_idx, end_idx if end_idx is not None else len(doc.paragraphs)):
+            if idx < len(doc.paragraphs):
+                keep_paragraph_elements.add(doc.paragraphs[idx]._element)
+
+        print(f"   🎯 Keeping {len(keep_paragraph_elements)} paragraph elements (para {start_idx} to {end_idx if end_idx else 'end'})")
+
+        elements_to_delete = []
+        element_count = 0
+        kept_count = 0
+
+        print(f"   🔄 Processing document body elements...")
+
+        # Iterate over the entire body
+        for element in doc.element.body:
+            element_count += 1
+
+            # Check if this element is a paragraph we want to keep
+            if element in keep_paragraph_elements:
+                kept_count += 1
+                continue  # Keep this element
+
+            # Otherwise, mark for deletion
+            elements_to_delete.append(element)
+
+        print(f"   📊 XML Processing Summary:")
+        print(f"      Total body elements: {element_count}")
+        print(f"      Elements to keep: {kept_count}")
+        print(f"      Elements to delete: {len(elements_to_delete)}")
+
+        print(f"🗑️ Deleting {len(elements_to_delete)} elements outside {target_annex}")
+
+        print(f"🗑️ Deleting {len(elements_to_delete)} elements outside {target_annex}")
+
+        # Delete all marked elements from the document tree
+        deleted_count = 0
+        print(f"   🗑️ Starting deletion of {len(elements_to_delete)} elements...")
+
+        for i, element in enumerate(elements_to_delete):
+            try:
+                if element.getparent() is not None:
+                    element.getparent().remove(element)
+                    deleted_count += 1
+
+                    # Progress logging every 100 deletions
+                    if (i + 1) % 100 == 0:
+                        print(f"   🗑️ Deleted {i + 1}/{len(elements_to_delete)} elements...")
+
+            except Exception as e:
+                print(f"   🚨 ERROR: Failed to delete element {i+1}: {str(e)}")
+                print(f"   🚨 Element type: {type(element)}")
+                print(f"   🚨 Element tag: {getattr(element, 'tag', 'unknown')}")
+                # Continue with other elements
+                continue
+
+        print(f"   ✅ Deleted {deleted_count} elements")
+
+        # Save the pruned document
+        print(f"   💾 Saving pruned document...")
+        doc.save(doc_path)
+
+        print(f"✅ Successfully pruned document to {target_annex}")
+        return True
+
+    except Exception as e:
+        print(f"❌ Error during pruning: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def prune_to_annex(doc_path: str, target_annex: str, all_annex_headers: List[str] = None, is_annex_i: bool = False, mapping_row = None) -> bool:
     """
     Remove all content except the target annex from the document.
     Iterates through document body to correctly handle both paragraphs AND tables.
@@ -213,65 +408,97 @@ def prune_to_annex(doc_path: str, target_annex: str, all_annex_headers: List[str
     Args:
         doc_path: Path to document to prune
         target_annex: Annex to keep (e.g., "ANNEX I")
+        all_annex_headers: List of all annex headers for boundary detection
+        is_annex_i: True if this is Annex I (special handling)
 
     Returns:
         True if successful, False otherwise
-
-    Note:
-        This function modifies the document in-place by removing XML elements
-        from the document body that fall outside the target annex boundaries.
     """
     try:
-        logger.debug(f"✂️ Pruning document to keep only {target_annex}")
+        print(f"✂️ PRUNING DOCUMENT to keep only {target_annex}")
+        print(f"   Document path: {doc_path}")
         doc = Document(doc_path)
+        print(f"   Loaded document with {len(doc.paragraphs)} paragraphs")
 
         # Find annex boundaries
-        start_idx, end_idx = find_annex_boundaries(doc, target_annex, all_annex_headers, is_annex_i)
+        start_idx, end_idx = find_annex_boundaries(doc, target_annex, all_annex_headers, is_annex_i, mapping_row)
+
+        print(f"   📍 Boundaries found: start={start_idx}, end={end_idx}")
 
         if start_idx is None:
-            logger.error(f"❌ Could not find start marker for {target_annex} in document")
+            print(f"❌ Could not find start marker for {target_annex} in document")
             return False
 
-        # Get the actual XML elements that act as our boundaries
-        start_element = doc.paragraphs[start_idx]._element
-        end_element = (doc.paragraphs[end_idx]._element
-                      if end_idx is not None and end_idx < len(doc.paragraphs)
-                      else None)
+        logger.info(f"📍 Boundaries: start={start_idx}, end={end_idx}")
+        logger.debug(f"   Start paragraph: '{doc.paragraphs[start_idx].text[:100] if start_idx < len(doc.paragraphs) else 'N/A'}...'")
+        if end_idx and end_idx < len(doc.paragraphs):
+            logger.debug(f"   End paragraph: '{doc.paragraphs[end_idx].text[:100]}...'")
+
+        # Build a set of paragraph elements that should be KEPT
+        keep_paragraph_elements = set()
+        for idx in range(start_idx, end_idx if end_idx is not None else len(doc.paragraphs)):
+            if idx < len(doc.paragraphs):
+                keep_paragraph_elements.add(doc.paragraphs[idx]._element)
+
+        print(f"   🎯 Keeping {len(keep_paragraph_elements)} paragraph elements (para {start_idx} to {end_idx if end_idx else 'end'})")
 
         elements_to_delete = []
-        in_keep_zone = False
+        element_count = 0
+        kept_count = 0
 
-        # Iterate over the entire body (paragraphs and tables)
+        print(f"   🔄 Processing document body elements...")
+
+        # Iterate over the entire body
         for element in doc.element.body:
-            if element == start_element:
-                in_keep_zone = True
+            element_count += 1
 
-            if end_element is not None and element == end_element:
-                in_keep_zone = False
+            # Check if this element is a paragraph we want to keep
+            if element in keep_paragraph_elements:
+                kept_count += 1
+                continue  # Keep this element
 
-            # Mark elements for deletion if they are outside the "keep zone"
-            if not in_keep_zone:
-                elements_to_delete.append(element)
+            # Otherwise, mark for deletion
+            elements_to_delete.append(element)
 
-        # Also mark the end marker paragraph itself for deletion
-        if end_element is not None:
-            elements_to_delete.append(end_element)
+        print(f"   📊 XML Processing Summary:")
+        print(f"      Total body elements: {element_count}")
+        print(f"      Elements to keep: {kept_count}")
+        print(f"      Elements to delete: {len(elements_to_delete)}")
 
-        logger.debug(f"🗑️ Deleting {len(elements_to_delete)} elements outside {target_annex}")
+        print(f"🗑️ Deleting {len(elements_to_delete)} elements outside {target_annex}")
 
         # Delete all marked elements from the document tree
-        for element in elements_to_delete:
-            if element.getparent() is not None:
-                element.getparent().remove(element)
+        deleted_count = 0
+        print(f"   🗑️ Starting deletion of {len(elements_to_delete)} elements...")
+
+        for i, element in enumerate(elements_to_delete):
+            try:
+                if element.getparent() is not None:
+                    element.getparent().remove(element)
+                    deleted_count += 1
+
+                    # Progress logging every 100 deletions
+                    if (i + 1) % 100 == 0:
+                        print(f"   🗑️ Deleted {i + 1}/{len(elements_to_delete)} elements...")
+
+            except Exception as e:
+                print(f"   🚨 ERROR: Failed to delete element {i+1}: {str(e)}")
+                print(f"   🚨 Element type: {type(element)}")
+                print(f"   🚨 Element tag: {getattr(element, 'tag', 'unknown')}")
+                # Continue with other elements
+                continue
+
+        print(f"   ✅ Deleted {deleted_count} elements")
 
         # Save the pruned document
+        print(f"   💾 Saving pruned document...")
         doc.save(doc_path)
 
-        logger.info(f"✅ Successfully pruned document to {target_annex}")
+        print(f"✅ Successfully pruned document to {target_annex}")
         return True
 
     except Exception as e:
-        logger.error(f"❌ Error during pruning: {e}")
+        logger.error(f"❌ Error during pruning: {e}", exc_info=True)
         return False
 
 
@@ -922,10 +1149,3 @@ def extract_section_xml(source_doc: Document, start_idx: int, end_idx: Optional[
     return extract_section_safe_copy(source_doc, start_idx, actual_end_idx)
 
 
-if __name__ == "__main__":
-    # Test functionality
-    print("📋 Document Splitter Module")
-    print("✅ Clone-and-prune approach for perfect document splitting")
-    print("✅ Preserves all scaffolding and formatting")
-    print("✅ Legacy copy functions available for fallback support")
-    print("✅ Ready for integration with processor.py")

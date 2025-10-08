@@ -2214,10 +2214,12 @@ def split_annexes(source_path: str, output_dir: str, language: str, country: str
     try:
         # Get actual headers from mapping file (what's really in the document)
         annex_i_header = str(mapping_row.get('Annex I Header in country language', 'ANNEX I')).strip()
+        annex_ii_header = str(mapping_row.get('Annex II Header in country language', 'ANNEX II')).strip()
         annex_iiib_header = str(mapping_row.get('Annex IIIB Header in country language', 'ANNEX III')).strip()
 
         print(f"📋 Using headers from mapping file:")
         print(f"   Annex I: '{annex_i_header}'")
+        print(f"   Annex II: '{annex_ii_header}'")
         print(f"   Annex IIIB: '{annex_iiib_header}'")
 
         # Use clone-and-prune approach with actual document headers
@@ -2861,6 +2863,11 @@ class DocumentProcessor:
     ) -> ProcessingResult:
         """Synchronous wrapper that calls async version."""
         import asyncio
+        print(f"🔧 DEBUG: Starting _save_and_split_document_sync for {mapping_row['Country']}")
+        print(f"🔧 DEBUG: Updates applied: {updates_applied}")
+        print(f"🔧 DEBUG: Document path: {original_path}")
+        print(f"🔧 DEBUG: Split dir: {split_dir}")
+        print(f"🔧 DEBUG: PDF dir: {pdf_dir}")
 
         # Run the async version in a new event loop
         loop = asyncio.new_event_loop()
@@ -2884,28 +2891,38 @@ class DocumentProcessor:
         updates_applied: List[str]
     ) -> ProcessingResult:
         """Save updated document and split into annexes."""
-        
+
         country = mapping_row['Country']
         language = mapping_row['Language']
         output_files = []
+
+        print(f"🔧 DEBUG: Entering async _save_and_split_document for {country}")
+        print(f"🔧 DEBUG: Document has {len(doc.paragraphs)} paragraphs")
         
         try:
             # Generate output filename
             base_name = original_path.stem
+            print(f"🔧 DEBUG: base_name = {base_name}")
             output_filename = generate_output_filename(base_name, language, country, "combined")
+            print(f"🔧 DEBUG: output_filename = {output_filename}")
             output_path = original_path.parent / output_filename
-            
+            print(f"🔧 DEBUG: output_path = {output_path}")
+
             # Save updated document
+            print(f"🔧 DEBUG: About to save document...")
             doc.save(str(output_path))
+            print(f"🔧 DEBUG: Document saved successfully!")
             output_files.append(str(output_path))
             self.logger.info(f"💾 Saved combined document: {output_filename}")
             
             # Split into annexes
+            print(f"🔧 DEBUG: About to start splitting into annexes...")
             self.logger.info("🔀 Splitting into separate annexes...")
             annex_i_path, annex_iiib_path = split_annexes(
                 str(output_path), str(split_dir), language, country, mapping_row
             )
-            
+            print(f"🔧 DEBUG: Split completed successfully!")
+
             output_files.extend([annex_i_path, annex_iiib_path])
             self.logger.info(f"✅ Split completed")
             
@@ -2926,6 +2943,10 @@ class DocumentProcessor:
             )
             
         except Exception as e:
+            print(f"🚨 ERROR: Exception in _save_and_split_document: {str(e)}")
+            print(f"🚨 ERROR: Exception type: {type(e).__name__}")
+            import traceback
+            traceback.print_exc()
             raise DocumentError(f"Failed to save and split document: {e}")
 
     def _batch_convert_pdfs(self, pdf_dir: Path) -> List[str]:
