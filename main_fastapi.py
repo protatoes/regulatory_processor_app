@@ -168,8 +168,8 @@ async def process_documents_background(
         
         # Configure processor (skip PDF conversion for web interface)
         config = ProcessingConfig(
-            convert_to_pdf=False,  # Skip PDF conversion to avoid LibreOffice issues
-            skip_pdf_in_background=True,
+            convert_to_pdf=True,  # False = Skip PDF conversion to avoid LibreOffice issues
+            skip_pdf_in_background=False,
             create_backups=True
         )
         
