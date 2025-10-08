@@ -40,7 +40,7 @@ class ProcessingConfig:
     overwrite_existing: bool = False
     log_level: str = "INFO"
     country_delimiter: str = ";"
-    skip_pdf_in_background: bool = True  # Skip PDF conversion in ThreadPoolExecutor context
+    skip_pdf_in_background: bool = False  # Skip PDF conversion in ThreadPoolExecutor context
 
 
 @dataclass

@@ -330,16 +330,6 @@ except Exception as e:
         print(f"   ❌ All conversion methods failed: {e}")
         raise RuntimeError(f"Failed to convert {doc_path} to PDF: All methods failed")
 
-# copy_paragraph function moved to document_splitter.py
-
-
-# copy_table function moved to document_splitter.py
-
-
-# _copy_paragraph_content function moved to document_splitter.py
-
-
-# copy_document_structure function moved to document_splitter.py
 
 
 def copy_headers_and_footers(source_doc: Document, dest_doc: Document) -> None:
